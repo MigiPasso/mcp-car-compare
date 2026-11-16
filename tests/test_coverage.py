@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from mcp_car_compare import tools
-from mcp_car_compare.models import SOURCE_STATUSES, Criteria, Listing, Page
+from mcp_car_compare.models import SOURCE_STATUSES, Criteria, Listing, Page, SourceError
 
 
 class FakeMcp:
@@ -65,6 +65,36 @@ def listing(index: int, *, market: str = "fr") -> Listing:
     )
 
 
+def corpus_source(
+    source: str,
+    market: str,
+    *,
+    listings: int,
+    status: str = "ok",
+    announced_total: int | None = None,
+    read: int = 0,
+    unique: int = 0,
+    truncated: bool = False,
+) -> dict:
+    """Une entrée de `coverage["sources"]` côté `offers` : les huit clés que
+    `store.py` émet (PLAN.md §5, décision D5).
+
+    Les huit sont écrites ici, jamais un sous-ensemble : c'est ce qui fait
+    échouer ce test si le bloc change de forme. Une entrée comparée à trois clés
+    laisserait passer une cinquième sans que rien ne le dise.
+    """
+    return {
+        "source": source,
+        "market": market,
+        "listings": listings,
+        "status": status,
+        "announced_total": announced_total,
+        "read": read,
+        "unique": unique,
+        "truncated": truncated,
+    }
+
+
 def install(tmp_path, source: ScriptedSource) -> FakeMcp:
     mcp = FakeMcp()
     tools.register(
@@ -92,23 +122,34 @@ def test_harvest_coverage_is_never_absent_or_empty(tmp_path):
     assert (coverage[0]["source"], coverage[0]["market"]) == ("autoscout24", "fr")
 
 
-def test_read_minus_dropped_duplicates_equals_unique(tmp_path):
-    # Une page qui se répète : le site rend deux fois les mêmes annonces.
+def test_read_is_unique_plus_dropped_duplicates_plus_dropped_invalid(tmp_path):
+    # Une page qui se répète : le site rend deux fois les mêmes annonces. La
+    # comptabilité est close à quatre termes (décision D4) : ce que les pages
+    # ont rendu, c'est ce qui reste plus ce qui a été écarté, et rien d'autre.
+    # Un cinquième terme non compté serait de la couverture perdue en silence.
     mcp = install(tmp_path, ScriptedSource([[0, 1, 2], [2, 3]]))
     row = harvest(mcp)["coverage"][0]
-    assert row["read"] - row["dropped_duplicates"] == row["unique"]
-    assert (row["read"], row["dropped_duplicates"], row["unique"]) == (5, 1, 4)
+    assert row["read"] == row["unique"] + row["dropped_duplicates"] + row["dropped_invalid"]
+    assert (row["read"], row["dropped_duplicates"], row["dropped_invalid"], row["unique"]) == (
+        5,
+        1,
+        0,
+        4,
+    )
 
 
 def test_every_reported_status_belongs_to_the_contract(tmp_path):
-    def factory(name: str):
-        if name == "autohero":
-            raise LookupError("pas d'adaptateur dans ce lot")
-        return ScriptedSource([[0]])
+    # Deux marchés du même site : l'un répond, l'autre échoue. Les deux statuts
+    # rendus doivent appartenir au vocabulaire fermé de `coverage` — sinon un
+    # client qui teste `status == "challenge"` ne verrait jamais rien venir.
+    class FailingOnOneMarket(ScriptedSource):
+        async def search(self, criteria: Criteria, page_number: int) -> Page:
+            if criteria.markets[0] == "de":
+                raise SourceError("503 Service Unavailable")
+            return await super().search(criteria, page_number)
 
-    mcp = FakeMcp()
-    tools.register(mcp, db_path=tmp_path / "corpus.db", source_factory=factory, clock=lambda: 0.0)
-    coverage = harvest(mcp, {"sources": ["autoscout24", "autohero"]})["coverage"]
+    mcp = install(tmp_path, FailingOnOneMarket([[0]]))
+    coverage = harvest(mcp, {"markets": ["fr", "de"]})["coverage"]
     assert [row["status"] for row in coverage] == ["ok", "error"]
     assert all(row["status"] in SOURCE_STATUSES for row in coverage)
 
@@ -125,7 +166,11 @@ def test_offers_coverage_describes_the_corpus_not_the_sum_of_the_harvests(tmp_pa
     coverage = mcp.tools["offers"](result["job_id"], None, 25)["coverage"]
     assert coverage["listings_distinct"] == 4
     assert coverage["runs"] == 1
-    assert coverage["sources"] == [{"source": "autoscout24", "market": "fr", "listings": 4}]
+    # 4 annonces distinctes dans le corpus, 5 lues par la récolte : les deux
+    # chiffres coexistent dans la même entrée, sans jamais s'additionner.
+    assert coverage["sources"] == [
+        corpus_source("autoscout24", "fr", listings=4, read=5, unique=4)
+    ]
 
 
 def test_two_offers_cover_the_corpus_once_without_duplicates(tmp_path):
@@ -147,7 +192,7 @@ def test_two_offers_cover_the_corpus_once_without_duplicates(tmp_path):
     corpus = {
         "listings_distinct": 9,
         "runs": 1,
-        "sources": [{"source": "autoscout24", "market": "fr", "listings": 9}],
+        "sources": [corpus_source("autoscout24", "fr", listings=9, read=9, unique=9)],
     }
     assert coverages[0] == coverages[-1] == corpus
 
@@ -160,20 +205,27 @@ def test_an_empty_corpus_reports_zeros_not_a_missing_block(tmp_path):
     assert page["coverage"] == {
         "listings_distinct": 0,
         "runs": 1,
-        "sources": [{"source": "autoscout24", "market": "fr", "listings": 0}],
+        "sources": [corpus_source("autoscout24", "fr", listings=0)],
     }
 
 
 def test_a_source_that_never_started_still_appears_with_zero(tmp_path):
-    # `autohero` n'a pas d'adaptateur dans ce lot : elle doit se voir dans le
-    # corpus avec zéro, pas disparaître du bloc.
+    # Une source du périmètre dont l'adaptateur refuse de se construire doit se
+    # voir dans le corpus avec zéro, pas disparaître du bloc. Une source HORS
+    # périmètre ne peut plus arriver ici : elle est refusée au parsage des
+    # critères (`test_tools.py`), pas récoltée puis comptée zéro.
+    def factory(_name: str):
+        raise SourceError("503 Service Unavailable")
+
     mcp = FakeMcp()
-    tools.register(mcp, db_path=tmp_path / "corpus.db", clock=lambda: 0.0)
-    result = harvest(mcp, {"sources": ["autohero"]})
+    tools.register(mcp, db_path=tmp_path / "corpus.db", source_factory=factory, clock=lambda: 0.0)
+    result = harvest(mcp)
     assert result["coverage"][0]["status"] == "error"
     coverage = mcp.tools["offers"](result["job_id"], None, 25)["coverage"]
     assert coverage["listings_distinct"] == 0
-    assert coverage["sources"] == [{"source": "autohero", "market": "fr", "listings": 0}]
+    assert coverage["sources"] == [
+        corpus_source("autoscout24", "fr", listings=0, status="error", truncated=True)
+    ]
 
 
 def test_the_corpus_counts_harvests_and_listings_separately(tmp_path):
@@ -184,6 +236,6 @@ def test_the_corpus_counts_harvests_and_listings_separately(tmp_path):
     assert coverage["runs"] == 2
     assert coverage["listings_distinct"] == 4
     assert coverage["sources"] == [
-        {"source": "autoscout24", "market": "de", "listings": 2},
-        {"source": "autoscout24", "market": "fr", "listings": 2},
+        corpus_source("autoscout24", "de", listings=2, read=2, unique=2),
+        corpus_source("autoscout24", "fr", listings=2, read=2, unique=2),
     ]

@@ -25,6 +25,12 @@ from typing import Iterable
 
 from .models import CorpusCoverage, Listing, SourceCoverage
 
+# BUSY_TIMEOUT_MS est le temps qu'une écriture attend un verrou tenu par une
+# autre connexion avant de rendre `database is locked`. Sans lui, un `offers`
+# lancé pendant un `harvest` échoue au lieu d'attendre la fin d'une transaction
+# de quelques millisecondes.
+BUSY_TIMEOUT_MS = 5000
+
 # Un tri par corpus doit être total, sinon deux pages successives peuvent
 # répéter ou sauter une annonce : `(source, market, source_id)` départage
 # toujours. Les prix et années inconnus passent en dernier (ils ne sont pas
@@ -94,6 +100,7 @@ CREATE TABLE IF NOT EXISTS "runs" (
     "read"               INTEGER NOT NULL DEFAULT 0,
     "unique"             INTEGER NOT NULL DEFAULT 0,
     "dropped_duplicates" INTEGER NOT NULL DEFAULT 0,
+    "dropped_invalid"    INTEGER NOT NULL DEFAULT 0,
     "truncated"          INTEGER NOT NULL DEFAULT 0,
     "reason"             TEXT NOT NULL DEFAULT '',
     "criteria_hash"      TEXT NOT NULL DEFAULT '',
@@ -109,6 +116,32 @@ CREATE TABLE IF NOT EXISTS "run_listings" (
     PRIMARY KEY ("job_id", "source", "market", "source_id")
 );
 """
+
+
+# Les colonnes ajoutées APRÈS la première version du schéma, avec leur
+# définition SQL. `CREATE TABLE IF NOT EXISTS` ne touche pas une table qui existe
+# déjà : `executescript` ci-dessus n'ajoute donc rien à une base écrite par la
+# version d'avant, et `write_run` échouerait sur l'INSERT (« table runs has no
+# column named dropped_invalid »). Une mise à jour casserait alors toute
+# récolte sur un corpus existant, sans que rien ne le signale avant l'appel.
+_ADDED_COLUMNS = (("runs", "dropped_invalid", "INTEGER NOT NULL DEFAULT 0"),)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Ajoute à une base existante les colonnes que le schéma courant suppose.
+
+    Un `ALTER TABLE` n'est idempotent qu'au prix de l'erreur : SQLite refuse
+    une colonne qui existe déjà (`duplicate column name`). C'est cette
+    erreur-là, et elle seule, qui est avalée — une table absente ou une base
+    verrouillée doit continuer de lever, sinon une migration ratée passerait
+    pour une migration faite.
+    """
+    for table, column, definition in _ADDED_COLUMNS:
+        try:
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}')
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
 
 
 class UnknownJobError(LookupError):
@@ -133,7 +166,15 @@ class Store:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.row_factory = sqlite3.Row
+        # WAL est ce qui permet à une lecture (`offers`) de se faire pendant une
+        # écriture (`harvest`) : en journal par défaut, le COMMIT de l'écrivain
+        # a besoin d'un verrou exclusif et échoue dès qu'un lecteur tient un
+        # instantané. Le mode est une propriété du FICHIER, il est donc posé à
+        # chaque ouverture (sans effet s'il l'est déjà).
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         self._conn.executescript(_SCHEMA)
+        _add_missing_columns(self._conn)
 
     def close(self) -> None:
         self._conn.close()
@@ -181,8 +222,9 @@ class Store:
             self._conn.execute(
                 'INSERT OR REPLACE INTO "runs" ('
                 '"job_id", "source", "market", "status", "announced_total", '
-                '"read", "unique", "dropped_duplicates", "truncated", "reason", '
-                '"criteria_hash", "sort") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                '"read", "unique", "dropped_duplicates", "dropped_invalid", '
+                '"truncated", "reason", "criteria_hash", "sort") '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (
                     job_id,
                     coverage.source,
@@ -192,6 +234,7 @@ class Store:
                     coverage.read,
                     coverage.unique,
                     coverage.dropped_duplicates,
+                    coverage.dropped_invalid,
                     int(coverage.truncated),
                     coverage.reason,
                     criteria_hash,
@@ -241,7 +284,24 @@ class Store:
 
     def corpus(self, job_id: str) -> CorpusCoverage:
         """Ce que la récolte contient réellement : annonces distinctes, nombre
-        de récoltes, et le détail par source. Jamais la somme des `read`."""
+        de récoltes, et le détail par source. Jamais la somme des `read`.
+
+        Chaque source porte aussi l'état de sa récolte (`read`, `unique`,
+        `announced_total`, `truncated`, `status`) : les annonces distinctes
+        disent la taille du corpus, ces champs disent la part du marché lue.
+        Un corpus de 400 annonces sur un marché qui en annonce 12 479 doit
+        pouvoir le dire à un appelant qui ne lit qu'`offers`.
+
+        Une ligne de `runs` par `(source, market)`, sans agrégat ni `GROUP BY` :
+        c'est la clé primaire de `runs`, `(job_id, source, market)`, qui
+        garantit qu'une paire n'y a qu'une ligne (`write_run` remplace, il
+        n'ajoute pas). Un `GROUP BY source, market` aurait rendu, pour deux
+        lignes d'une même paire, un `status` et un `read` choisis arbitrairement
+        parmi elles ; la sous-requête de comptage laisse au contraire chaque
+        ligne de récolte visible au lieu de la fusionner en silence. Le jour où
+        une deuxième récolte de la même paire devra cohabiter avec la première,
+        c'est la clé primaire qu'il faudra changer, et cette requête le montrera.
+        """
         run_count = self._conn.execute(
             'SELECT COUNT(*) FROM "runs" WHERE "job_id" = ?', (job_id,)
         ).fetchone()[0]
@@ -250,10 +310,13 @@ class Store:
         ).fetchone()[0]
         rows = self._conn.execute(
             'SELECT r."source" AS source, r."market" AS market, '
-            'COUNT(rl."source_id") AS listings FROM "runs" AS r '
-            'LEFT JOIN "run_listings" AS rl ON rl."job_id" = r."job_id" '
-            'AND rl."source" = r."source" AND rl."market" = r."market" '
-            'WHERE r."job_id" = ? GROUP BY r."source", r."market" '
+            'r."status" AS status, r."announced_total" AS announced_total, '
+            'r."read" AS read, r."unique" AS "unique", '
+            'r."truncated" AS truncated, '
+            '(SELECT COUNT(*) FROM "run_listings" AS rl '
+            'WHERE rl."job_id" = r."job_id" AND rl."source" = r."source" '
+            'AND rl."market" = r."market") AS listings '
+            'FROM "runs" AS r WHERE r."job_id" = ? '
             'ORDER BY r."source", r."market"',
             (job_id,),
         ).fetchall()
@@ -265,6 +328,11 @@ class Store:
                     "source": row["source"],
                     "market": row["market"],
                     "listings": row["listings"],
+                    "status": row["status"],
+                    "announced_total": row["announced_total"],
+                    "read": row["read"],
+                    "unique": row["unique"],
+                    "truncated": bool(row["truncated"]),
                 }
                 for row in rows
             ],

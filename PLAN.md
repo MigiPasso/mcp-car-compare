@@ -133,7 +133,9 @@ deux sources) reste deux lignes.
 Quatre outils, par fonction. Chaque réponse porte un bloc `coverage`.
 
 ```jsonc
-// 1. list_brands(source?) -> {brands:[{value,label,models:[…]}]}       // instantané
+// 1. list_brands(source?, market="fr") -> {source, market, brands:[{value,label}], error?}
+//      instantané. Pas de `models` en v1 : la page de taxonomie ne les porte pas,
+//      et un champ toujours vide est une promesse creuse (revue du 16/11).
 // 2. harvest(criteria, budget_s=60, sources?) -> {job_id, coverage, cursor}
 //      criteria = {make, model, year_min, year_max, km_max, price_min,
 //                  price_max, fuel, gear, markets, pages_max, sort}
@@ -153,8 +155,11 @@ Quatre outils, par fonction. Chaque réponse porte un bloc `coverage`.
  "announced_total":465,"read":60,"unique":60,"dropped_duplicates":0,
  "truncated":true,"reason":"budget de 60 s atteint"}
 // dans offers / analyze_models : le corpus, jamais la somme des récoltes
-{"corpus":{"listings_distinct":812,"runs":3,"oldest_seen":"…","newest_seen":"…"},
- "sources":[{"source":"autoscout24","market":"fr","listings":612}]}
+// (forme réelle, à la racine — il n'y a pas de clé `corpus`)
+{"listings_distinct":812,"runs":3,
+ "sources":[{"source":"autoscout24","market":"fr","listings":612,
+             "status":"ok","announced_total":465,"read":60,"unique":60,
+             "truncated":true}]}
 ```
 
 **On n'additionne jamais deux récoltes.** `announced_total` est un instantané du
@@ -250,6 +255,15 @@ Trois ambiguïtés qu'un implémenteur aurait résolues de travers :
 | Unité des prix | **euros entiers, tel qu'affiché par le site**, jamais recalculé. `vat_label` recopié tel quel, vide si le site se tait. Aucun prix « débattu de TVA », aucun frais |
 | Tri par défaut | `sort: "price_asc"` explicite dans les critères. **Changer de tri invalide le curseur** : un curseur porte son tri, et le serveur refuse un curseur repris avec un autre tri plutôt que de rendre des pages incohérentes |
 | `budget_s` contre `pages_max` | `budget_s` **gagne** : `pages_max` est un plafond par source, jamais un objectif. `status:"capped"` dit lequel des deux a coupé |
+
+Décisions prises pendant le premier lot, après mesure :
+
+| Question | Décision |
+|---|---|
+| `truncated` quand le site n'annonce aucun total | `true` — on ne sait pas s'il reste des annonces, et le `reason` dit « plafond atteint, total annoncé inconnu » |
+| Marqueur de défi anti-bot | cherché **seulement** sur un statut ≠ 200 ou en l'absence de `__NEXT_DATA__` : une annonce peut citer la chaîne dans sa description sans que la page soit un défi |
+| Source hors périmètre dans `criteria.sources` | **refusée au parsage**, en nommant la source et celles servies. Un `status:"error"` se lirait « cette source a échoué », ce qui est faux : elle n'est pas implémentée |
+| `list_brands.models` | **retiré** de la charge : jamais rempli en production (301 marques, 0 modèle) |
 
 ## 9. La décision qui reste ouverte
 

@@ -16,6 +16,7 @@ Aucun test ne touche le réseau : le transport `httpx` est factice.
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 
 import httpx
@@ -82,6 +83,71 @@ def test_page_de_defi_ne_rend_rien_de_silencieux():
     )
     with pytest.raises(StructureChanged):
         search(defi)
+
+
+def next_data_page(page_props: dict, *, body_extra: str = "") -> str:
+    """Page minimale autour d'un `pageProps` fabriqué, corps libre en plus.
+
+    Sert aux cas qu'aucune capture ne porte (marqueur de défi présent dans une
+    page valide), et le fragment est écrit ici plutôt que dans une fixture pour
+    qu'il ne se fasse jamais passer pour une page du site.
+    """
+    payload = json.dumps({"props": {"pageProps": page_props}})
+    return (
+        '<!DOCTYPE html><html><head><title>AutoScout24</title>'
+        '<script id="__NEXT_DATA__" type="application/json">'
+        f"{payload}</script></head><body>{body_extra}</body></html>"
+    )
+
+
+def test_une_page_200_valide_contenant_le_marqueur_reste_une_page_de_resultats():
+    # Décision D2 : `CHALLENGE_MARKER` n'est cherché que sur un statut non-200 ou
+    # sans `__NEXT_DATA__`. Une page 200 qui porte sa charge est une page de
+    # résultats, même si son texte cite l'hôte du défi : une annonce peut le
+    # mentionner (lien de suivi, description), et juger une 200 sur une chaîne
+    # ferait perdre une page entière de 20 annonces sans qu'aucun chiffre ne le
+    # dise.
+    annonce = {
+        "id": "a",
+        "url": "/offres/a",
+        "price": {"priceRaw": 10_000},
+        "vehicle": {"make": "Renault", "modelGroup": "Clio", "mileageInKm": "10 000 km"},
+    }
+    body = next_data_page(
+        {"numberOfResults": 1, "listings": [annonce]},
+        body_extra='<a href="https://geo.captcha-delivery.com/track?x=1">suivi</a>',
+    )
+    resultat = search(body)
+    assert [annonce_lue.source_id for annonce_lue in resultat.listings] == ["a"]
+    assert resultat.announced_total == 1
+
+
+def test_un_200_sans_next_data_portant_le_marqueur_est_un_challenge():
+    # Le cas que le marqueur existe pour reconnaître : un 200 sans charge
+    # utile. La distinction est portée par `SourceError.status`, pas par le
+    # message, pour que `coverage.status="challenge"` soit atteignable.
+    defi = (
+        '<!DOCTYPE html><html><body><iframe '
+        'src="https://geo.captcha-delivery.com/captcha/?initialCid=x"></iframe>'
+        "</body></html>"
+    )
+    with pytest.raises(SourceError) as caught:
+        search(defi)
+    assert caught.value.status == "challenge"
+
+
+def test_un_403_portant_le_marqueur_est_un_challenge_pas_une_erreur():
+    with pytest.raises(SourceError) as caught:
+        search("<html><body>captcha-delivery.com</body></html>", status=403)
+    assert caught.value.status == "challenge"
+
+
+def test_un_403_sans_marqueur_reste_une_erreur_de_source():
+    # Sans cette assertion, `status="challenge"` pourrait être rendu pour tout
+    # refus et ne plus rien distinguer.
+    with pytest.raises(SourceError) as caught:
+        search("<html><body>Forbidden</body></html>", status=403)
+    assert caught.value.status == "error"
 
 
 def test_next_data_illisible_leve_structure_changed():

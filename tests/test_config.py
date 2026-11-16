@@ -12,6 +12,7 @@ import dataclasses
 import pytest
 
 from mcp_car_compare import config
+from mcp_car_compare.models import MAX_BUDGET_S, MAX_PAGES
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +57,50 @@ def test_entier_illisible_nomme_la_variable(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("MCC_BUDGET_S", "trente")
 
     with pytest.raises(ValueError, match="MCC_BUDGET_S"):
+        config.load_config()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MCC_BUDGET_S", "0"),
+        ("MCC_BUDGET_S", "-1"),
+        ("MCC_PAGES_MAX", "0"),
+        ("MCC_PAGES_MAX", "-5"),
+    ],
+)
+def test_une_borne_nulle_ou_negative_est_refusee(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    """Zéro et négatif sont refusés, pas rabattus sur le défaut.
+
+    `MCC_PAGES_MAX=0` n'est pas « aucune page » mais une récolte qui ne lit rien
+    en ayant l'air de tourner ; `MCC_BUDGET_S=0`, une récolte toujours coupée.
+    Un rabattement silencieux ferait croire à un réglage qui n'a pas été lu.
+    """
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=f"{name} doit être un entier >= 1"):
+        config.load_config()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("MCC_BUDGET_S", str(MAX_BUDGET_S + 1)), ("MCC_PAGES_MAX", str(MAX_PAGES + 1))],
+)
+def test_une_borne_au_dessus_du_plafond_est_refusee(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    """Les mêmes plafonds qu'au parsage des critères, côté configuration.
+
+    `MAX_PAGES` est le plafond mesuré du site, `MAX_BUDGET_S` la durée au-delà
+    de laquelle un client MCP a abandonné : ce sont des bornes du serveur, pas
+    des objectifs, et la variable d'environnement n'est pas un chemin plus
+    permissif que l'argument d'outil.
+    """
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=f"{name} ne peut pas dépasser"):
         config.load_config()
 
 

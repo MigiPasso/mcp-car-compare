@@ -6,18 +6,26 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-# Les tests ne servent pas à l'exécution : la preuve E0 se lance depuis un
-# conteneur jetable qui monte le dépôt, pas depuis l'image de production.
-tests/
-# requirements-dev.txt n'apporte que pytest ; l'image ne teste rien.
-requirements-dev.txt
-# Une base locale ne doit jamais entrer dans l'image : le corpus est un volume.
+# Une base locale ne doit jamais entrer dans une image : le corpus est un volume.
+# Les deux side-cars WAL sont listés à part : `Store` force `journal_mode=WAL`,
+# et `corpus.db-wal` / `corpus.db-shm` ne matchent ni `*.db` ni `*.db-journal`.
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 data/
-# Rien de ce qui documente le dépôt n'a besoin d'être dans l'image.
-*.md
-mcp.example.json
+/profile/
 # Aucune variable d'environnement, aucun secret, ne s'embarque dans une image.
 .env
 .env.*
+# Rien de ce qui documente le dépôt n'a besoin d'être dans une image.
+*.md
+mcp.example.json
+
+# `tests/` et `requirements-dev.txt` ne sont PAS exclus : `Dockerfile.test` les
+# embarque (`COPY tests/`), et un `.dockerignore` vaut pour tous les builds du
+# répertoire — l'exclure ici casserait l'image de test en silence, avec un
+# `COPY tests/` qui échoue en « no such file or directory ».

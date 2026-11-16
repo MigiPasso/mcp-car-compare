@@ -28,6 +28,7 @@ from mcp_car_compare.models import (
     StructureChanged,
 )
 from mcp_car_compare.sources.autoscout24 import (
+    MAX_BODY_BYTES,
     PAGE_PAUSE_S,
     USER_AGENT,
     Autoscout24,
@@ -259,6 +260,58 @@ def test_annonce_total_absent_vaut_none_et_n_est_pas_comble():
     assert len(page.listings) == 1
 
 
+def test_un_corps_plus_gros_que_le_plafond_est_refuse_pendant_la_lecture():
+    # Une page de résultats pèse ~686 Ko ; 4 Mio laissent six fois la marge d'une
+    # page légitime. Sans plafond, une réponse d'erreur de plusieurs centaines
+    # de Mo occuperait la mémoire du serveur avant qu'on puisse la refuser —
+    # `response.text` chargerait le corps entier sans broncher. Le refus nomme
+    # le plafond, sinon l'appelant ne sait pas quoi corriger.
+    oversized = "x" * (MAX_BODY_BYTES + 1)
+    with pytest.raises(SourceError, match=str(MAX_BODY_BYTES)):
+        search_html(oversized, "fr")
+
+
+def test_un_corps_de_la_taille_du_plafond_est_lu_jusqu_au_bout():
+    # Frontière de l'autre côté : le refus porte sur « plus de », pas sur « au
+    # moins ». Un corps exactement au plafond traverse la lecture bornée ; il est
+    # ensuite refusé par le parseur (pas de `__NEXT_DATA__`), ce qui distingue
+    # les deux refus au lieu de les confondre.
+    at_limit = "x" * MAX_BODY_BYTES
+    with pytest.raises(StructureChanged, match="__NEXT_DATA__"):
+        search_html(at_limit, "fr")
+
+
+def test_un_corps_qui_arrive_au_compte_goutte_est_coupe_par_le_delai_de_lecture():
+    # Le délai de lecture de `httpx` se réinitialise à chaque morceau reçu : une
+    # source qui envoie un octet toutes les 29 s garde la lecture ouverte
+    # indéfiniment, et le budget de `harvest` n'y voit rien puisqu'il n'est
+    # testé qu'entre deux pages. La lecture bornée l'est donc aussi dans le
+    # TEMPS, pas seulement en octets. Le plafond de temps est injecté ici
+    # (0,2 s) pour que le test ne dépende pas d'une durée réelle : le corps
+    # goûte un octet toutes les 20 ms et n'en finit jamais.
+    async def drip():
+        while True:
+            await asyncio.sleep(0.02)
+            yield b"x"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=drip())
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await Autoscout24(client, "fr", body_timeout_s=0.2).search(
+                Criteria(markets=("fr",)), 1
+            )
+
+    async def bounded():
+        # Sans borne dans la lecture, ce scénario ne finirait jamais : le
+        # `wait_for` fait échouer le test au lieu de laisser la suite pendre.
+        return await asyncio.wait_for(scenario(), timeout=5)
+
+    with pytest.raises(SourceError, match="corps"):
+        run(bounded())
+
+
 def test_dedoublonnage_intra_page_garde_le_premier_et_ne_touche_pas_le_total():
     doublon = raw_listing("a", price={"priceRaw": 9999, "vatLabel": ""})
     body = page_html(
@@ -459,10 +512,12 @@ def test_brands_lit_la_taxonomie_du_marche():
             return await Autoscout24(client, "de").brands()
 
     brands = run(scenario())
-    assert brands == [
-        {"value": "13", "label": "BMW", "models": [{"value": "18480", "label": "116"}]},
-        {"value": "9", "label": "Audi", "models": []},
-    ]
+    # Décision D6 : `value` et `label`, sans `models`. La taxonomie ne les porte
+    # que sur une page filtrée sur la marque, et mesuré en production
+    # `list_brands` rend 301 marques et 0 modèle : un champ toujours vide est
+    # une promesse creuse, pas une donnée. `value` est ce qui se renvoie dans
+    # `make` (voir `test_tools.py`, le test qui le chaîne).
+    assert brands == [{"value": "13", "label": "BMW"}, {"value": "9", "label": "Audi"}]
     request = recorder.requests[0]
     assert (request.url.host, request.url.path) == ("www.autoscout24.de", "/lst")
     assert request.url.params["atype"] == "C"

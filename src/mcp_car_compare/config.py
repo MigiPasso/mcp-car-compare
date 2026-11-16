@@ -22,6 +22,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .models import MAX_BUDGET_S, MAX_PAGES
+
 # Le défaut vise le volume Docker : dans l'image, `/data` est le point de
 # montage du corpus. Hors conteneur ce chemin n'est pas inscriptible, ce qui
 # est voulu — un serveur lancé sur l'hôte doit dire où il écrit (`MCC_DB`)
@@ -47,27 +49,38 @@ class Config:
     log_level: str
 
 
-def _env_int(name: str, default: int) -> int:
-    """Lit un entier, et refuse bruyamment une valeur illisible.
+def _env_int(name: str, default: int, *, maximum: int) -> int:
+    """Lit un entier, et refuse bruyamment une valeur illisible ou hors bornes.
 
     Un `MCC_BUDGET_S=trente` rabattu silencieusement sur 60 ferait croire à un
     budget de 30 s alors que le serveur en utilise 60 : l'erreur doit nommer la
-    variable plutôt que produire un chiffre faux.
+    variable plutôt que produire un chiffre faux. Le zéro et le négatif sont
+    refusés pour la même raison : `MCC_PAGES_MAX=0` n'est pas « aucune page »,
+    c'est une récolte qui ne lit rien en ayant l'air de tourner, et
+    `MCC_BUDGET_S=0` une récolte toujours coupée.
     """
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
     try:
-        return int(raw.strip())
+        value = int(raw.strip())
     except ValueError:
         raise ValueError(f"{name} doit être un entier, reçu {raw!r}") from None
+    if value < 1:
+        raise ValueError(f"{name} doit être un entier >= 1, reçu {value}")
+    if value > maximum:
+        raise ValueError(
+            f"{name} ne peut pas dépasser {maximum}, reçu {value} "
+            "(c'est une borne du serveur, pas un objectif)"
+        )
+    return value
 
 
 def load_config() -> Config:
     """La configuration courante, relue depuis l'environnement à chaque appel."""
     return Config(
         db_path=Path(os.environ.get("MCC_DB", str(DEFAULT_DB))),
-        budget_s=_env_int("MCC_BUDGET_S", DEFAULT_BUDGET_S),
-        pages_max=_env_int("MCC_PAGES_MAX", DEFAULT_PAGES_MAX),
+        budget_s=_env_int("MCC_BUDGET_S", DEFAULT_BUDGET_S, maximum=MAX_BUDGET_S),
+        pages_max=_env_int("MCC_PAGES_MAX", DEFAULT_PAGES_MAX, maximum=MAX_PAGES),
         log_level=os.environ.get("MCC_LOG_LEVEL", DEFAULT_LOG_LEVEL).strip().upper(),
     )

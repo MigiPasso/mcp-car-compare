@@ -8,17 +8,28 @@ l'horloge est pilotée à la main — aucune assertion ne dépend d'une durée r
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 from mcp_car_compare import tools
 from mcp_car_compare.cursor import Cursor, CursorError, decode, encode
-from mcp_car_compare.models import Criteria, Listing, Page, SourceError, StructureChanged
-from mcp_car_compare.store import UnknownJobError
+from mcp_car_compare.models import (
+    MAX_BUDGET_S,
+    MAX_PAGES,
+    Criteria,
+    Listing,
+    Page,
+    SourceError,
+    StructureChanged,
+)
+from mcp_car_compare.sources.autoscout24 import search_url
+from mcp_car_compare.store import Store, UnknownJobError
 
 
 # --- doublures -----------------------------------------------------------------
@@ -55,7 +66,11 @@ class FakeClock:
 
 
 class FakeClient:
-    """Client httpx factice : note sa construction, ses options et sa fermeture."""
+    """Client httpx factice : note sa construction, ses options et sa fermeture.
+
+    `stream` échoue comme un site injoignable : c'est ce qui permet à un test
+    d'exercer le chemin réseau réel de l'adaptateur sans ouvrir de connexion.
+    """
 
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
@@ -66,6 +81,9 @@ class FakeClient:
 
     async def __aexit__(self, *_exc: object) -> None:
         self.closed = True
+
+    def stream(self, *_args: object, **_kwargs: object):
+        raise httpx.ConnectError("connexion refusée", request=httpx.Request("GET", "https://example.test"))
 
 
 class ChallengeDetected(Exception):
@@ -121,7 +139,9 @@ class FakeSource:
         self.brand_calls += 1
         if self.error is not None:
             raise self.error
-        return [{"value": "renault", "label": "Renault", "models": [{"value": "clio", "label": "Clio"}]}]
+        # La forme réelle de l'adaptateur (D6) : un identifiant numérique et son
+        # libellé, sans `models` — la taxonomie ne les porte pas.
+        return [{"value": "13", "label": "BMW"}]
 
 
 def install(tmp_path, source: FakeSource, *, clock=None, db_path=None) -> FakeMcp:
@@ -141,8 +161,8 @@ def harvest(mcp: FakeMcp, criteria: dict | None = None, budget_s: int | None = N
     return asyncio.run(mcp.tools["harvest"](criteria or {}, budget_s))
 
 
-def brands(mcp: FakeMcp, source: str = "autoscout24") -> dict:
-    return asyncio.run(mcp.tools["list_brands"](source))
+def brands(mcp: FakeMcp, source: str = "autoscout24", market: str = "fr") -> dict:
+    return asyncio.run(mcp.tools["list_brands"](source, market))
 
 
 # --- déclaration ---------------------------------------------------------------
@@ -178,8 +198,8 @@ def test_importing_the_tools_loads_no_source_adapter():
 
 
 def test_a_harvest_opens_one_http_client_for_the_whole_run_and_closes_it(tmp_path, monkeypatch):
-    # Deux sources, un seul client : un pool par source ferait autant de
-    # sockets à fuir dès qu'une source lève.
+    # Deux marchés, un seul client : un pool par marché ferait autant de sockets
+    # à fuir dès qu'une requête lève.
     created: list[FakeClient] = []
 
     def build(**kwargs: object) -> FakeClient:
@@ -190,7 +210,7 @@ def test_a_harvest_opens_one_http_client_for_the_whole_run_and_closes_it(tmp_pat
     monkeypatch.setattr(tools.httpx, "AsyncClient", build)
     mcp = FakeMcp()
     tools.register(mcp, db_path=tmp_path / "corpus.db")  # fabrique réelle
-    result = harvest(mcp, {"sources": ["autohero", "lacentrale"]})
+    result = harvest(mcp, {"markets": ["fr", "de"]})
     assert [row["status"] for row in result["coverage"]] == ["error", "error"]
     assert len(created) == 1
     assert created[0].closed is True
@@ -206,8 +226,9 @@ def test_list_brands_has_no_coverage_and_harvests_nothing(tmp_path):
     source = FakeSource([Page(listings=[listing(1)])])
     mcp = install(tmp_path, source)
     result = brands(mcp)
-    assert sorted(result) == ["brands", "error", "source"]
-    assert result["brands"][0]["value"] == "renault"
+    assert sorted(result) == ["brands", "error", "market", "source"]
+    assert result["brands"][0]["value"] == "13"
+    assert "models" not in result["brands"][0]  # D6 : jamais rempli en v1
     assert result["error"] == ""  # pas d'erreur muette, pas de raison inventée
     assert source.brand_calls == 1
     assert source.search_count == 0  # aucune récolte
@@ -241,6 +262,94 @@ def test_list_brands_refuses_an_unknown_source(tmp_path):
         brands(mcp, "leboncoin")
 
 
+def test_list_brands_refuses_an_unknown_market(tmp_path):
+    # `market` est un argument de l'outil : un marché inconnu construirait une
+    # adresse qui répond 404 et rendrait « aucune marque » sans erreur.
+    mcp = install(tmp_path, FakeSource([Page(listings=[])]))
+    with pytest.raises(ValueError, match="marché inconnu"):
+        brands(mcp, "autoscout24", market="it")
+
+
+def brands_page() -> str:
+    """Page minimale portant une taxonomie, dans la forme que lit l'adaptateur.
+
+    Écrite ici plutôt que tirée d'une fixture : aucune capture de page
+    `/lst?atype=C` n'existe dans le dépôt, et un fragment fabriqué ne doit pas se
+    faire passer pour une page du site.
+    """
+    page_props = {
+        "numberOfResults": 465,
+        "listings": [],
+        "taxonomy": {"makesSorted": [{"label": "BMW", "value": 13}]},
+    }
+    payload = json.dumps({"props": {"pageProps": page_props}})
+    return (
+        '<!DOCTYPE html><html><head><script id="__NEXT_DATA__" type="application/json">'
+        f"{payload}</script></head><body></body></html>"
+    )
+
+
+def test_a_brand_value_from_list_brands_is_usable_as_a_make(tmp_path):
+    # L'identifiant de marque n'a qu'un usage : être renvoyé tel quel dans
+    # `make`. Le chaîner est la seule preuve que le catalogue rend quelque chose
+    # d'utilisable — un slug (« bmw ») traverserait `list_brands` sans problème
+    # et ferait échouer `harvest` en `SourceError`, loin du regard de
+    # l'appelant.
+    source = FakeSource([Page(listings=[listing(1)])])
+    mcp = install(tmp_path, source)
+    value = brands(mcp)["brands"][0]["value"]
+    harvest(mcp, {"make": value, "pages_max": 1})
+    criteria = source.searches[0][0]
+    assert value == "13"
+    assert criteria.make == value
+    # Même entrée, même constructeur d'URL que l'adaptateur réel : des chiffres
+    # passent, un libellé serait refusé.
+    assert httpx.URL(search_url(criteria, 1, "fr")).params["mmmv"] == "13|||"
+
+
+def test_list_brands_traverses_the_real_factory_for_the_requested_market(tmp_path, monkeypatch):
+    """`list_brands` est le seul outil dont les arguments ne portent pas le
+    marché de la récolte : c'est `_default_source` qui décide du domaine.
+
+    Ce test le traverse pour de vrai (adaptateur réel, transport factice). Sans
+    lui, `market="de"` pourrait lire `.fr` sans que rien ne le dise, et les
+    identifiants rendus ne filtreraient rien sur `.de`.
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=brands_page())
+
+    class RecordingClient(httpx.AsyncClient):
+        """Vrai client httpx, options retenues, transport factice."""
+
+        instances: list["RecordingClient"] = []
+
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)  # type: ignore[arg-type]
+            RecordingClient.instances.append(self)
+
+    monkeypatch.setattr(tools.httpx, "AsyncClient", RecordingClient)
+    mcp = FakeMcp()
+    tools.register(mcp, db_path=tmp_path / "corpus.db")  # fabrique réelle
+    result = brands(mcp, "autoscout24", market="de")
+    assert result["error"] == ""
+    assert result["market"] == "de"
+    assert result["brands"] == [{"value": "13", "label": "BMW"}]
+    # Les deux options du client d'un appel : aucune redirection suivie (une
+    # .de redirigée serait lue comme .de, et ses annonces porteraient le mauvais
+    # marché), et un délai borné.
+    assert RecordingClient.instances[0].kwargs == {
+        "follow_redirects": False,
+        "timeout": tools.HTTP_TIMEOUT_S,
+    }
+    assert (requests[0].url.host, requests[0].url.path) == ("www.autoscout24.de", "/lst")
+    assert requests[0].url.params["atype"] == "C"
+    assert requests[0].headers["accept-language"] == "de-DE,de;q=0.9"
+
+
 # --- harvest : ce qu'il rend ---------------------------------------------------
 
 
@@ -259,6 +368,7 @@ def test_harvest_returns_a_job_its_coverage_and_an_entry_cursor(tmp_path):
         "read",
         "unique",
         "dropped_duplicates",
+        "dropped_invalid",
         "truncated",
         "reason",
     }
@@ -277,6 +387,41 @@ def test_harvest_stops_when_the_site_runs_out_of_pages(tmp_path):
     assert row["reason"] == ""
 
 
+def test_the_stop_condition_compares_distinct_listings_not_the_read_counter(tmp_path):
+    # Le banc d'AutoScout24 rend 20 annonces pour 19 identifiants uniques :
+    # `read` atteint donc le total annoncé alors qu'une annonce annoncée n'a
+    # jamais été lue. Une requête qui annonce 20 résultats s'arrêtait là,
+    # `status="ok"` et `truncated=False` : une annonce manquait, et rien ne le
+    # disait. La complétude se juge sur les annonces DISTINCTES.
+    page_one = Page(
+        listings=[listing(index) for index in range(19)], rendered=20, announced_total=20
+    )
+    page_two = Page(
+        listings=[listing(index) for index in range(19, 38)], rendered=20, announced_total=20
+    )
+    mcp = install(tmp_path, FakeSource([page_one, page_two]))
+    row = harvest(mcp, {"pages_max": 5})["coverage"][0]
+    # La page 2 a bien été demandée : 38 annonces distinctes, 40 lues.
+    assert (row["read"], row["unique"], row["dropped_duplicates"]) == (40, 38, 2)
+    assert row["truncated"] is False
+
+
+def test_an_empty_page_after_duplicates_still_reports_truncation(tmp_path):
+    # Même comptabilité, autre sortie de boucle : le site s'arrête de rendre des
+    # annonces après une page dont `read` a déjà atteint le total annoncé, mais
+    # dont les annonces distinctes, elles, ne l'atteignent pas. Comparer `read`
+    # au total annoncé laissait `truncated=False` : le plafond du site se lisait
+    # comme une fin de marché.
+    page_one = Page(
+        listings=[listing(index) for index in range(19)], rendered=20, announced_total=20
+    )
+    mcp = install(tmp_path, FakeSource([page_one, Page(listings=[])]))
+    row = harvest(mcp, {"pages_max": 5})["coverage"][0]
+    assert (row["read"], row["unique"]) == (20, 19)
+    assert row["truncated"] is True
+    assert "plafond du site" in row["reason"]
+
+
 def test_harvest_says_when_pages_max_cut_it_short(tmp_path):
     source = FakeSource([Page(listings=[listing(1)]), Page(listings=[listing(2)])])
     mcp = install(tmp_path, source)
@@ -284,6 +429,19 @@ def test_harvest_says_when_pages_max_cut_it_short(tmp_path):
     assert row["status"] == "ok"
     assert row["truncated"] is True
     assert "pages_max=2" in row["reason"]
+
+
+def test_un_arret_sur_pages_max_sans_total_annonce_dit_que_le_total_manque(tmp_path):
+    # Décision D1 : `truncated=true` reste juste quand le site n'annonce aucun
+    # total (on ne sait pas s'il restait des annonces), mais le `reason` doit
+    # dire lequel des deux chiffres manque. Sinon « plafond atteint après 2
+    # annonce(s) » se lirait comme une fin de marché.
+    source = FakeSource([Page(listings=[listing(1)]), Page(listings=[listing(2)])])
+    mcp = install(tmp_path, source)
+    row = harvest(mcp, {"pages_max": 2})["coverage"][0]
+    assert row["announced_total"] is None
+    assert row["truncated"] is True
+    assert "inconnu" in row["reason"]  # « total annoncé inconnu »
 
 
 # --- harvest : budget ----------------------------------------------------------
@@ -303,6 +461,25 @@ def test_harvest_never_exceeds_its_budget(tmp_path):
     assert source.search_count == 2
 
 
+def test_the_budget_reason_counts_distinct_listings_not_the_read_counter(tmp_path):
+    # Le `reason` est le seul chiffre qu'un client peut comparer au total annoncé
+    # par le site. S'il interpole `read` (doublons compris) au lieu des annonces
+    # distinctes, il annonce plus que le marché : revenir à `{read}` ici laissait
+    # les 227 tests verts, donc ce cas est le seul à certifier l'interpolation.
+    # Mesuré sur une page qui rend 20 annonces dont une en double.
+    clock = FakeClock()
+    page = Page(listings=[listing(index) for index in range(19)], rendered=20)
+    source = FakeSource([page, Page(listings=[listing(100)])])
+    source.on_search = lambda _criteria, _page: clock.advance(40)
+    mcp = install(tmp_path, source, clock=clock)
+    # Budget 35 s : la page 1 coûte 40 s, donc la boucle s'arrête AVANT la page 2
+    # sur la branche du budget, avec une seule page lue et un doublon dedans.
+    row = harvest(mcp, {"pages_max": 5}, 35)["coverage"][0]
+    assert row["status"] == "capped"
+    assert (row["read"], row["unique"], row["dropped_duplicates"]) == (20, 19, 1)
+    assert "19 annonce(s) distincte(s) (20 lue(s))" in row["reason"]
+
+
 def test_a_source_cut_before_its_first_page_reads_zero(tmp_path):
     source = FakeSource([Page(listings=[listing(1)])])
     mcp = install(tmp_path, source, clock=FakeClock(step=600))
@@ -313,21 +490,32 @@ def test_a_source_cut_before_its_first_page_reads_zero(tmp_path):
 
 
 def test_the_budget_is_per_source_not_global(tmp_path):
+    # Deux sources, une horloge : 40 s par page, budget de 60 s. Un budget
+    # global aurait laissé la deuxième source à zéro, puisque la première a
+    # déjà consommé 60 s à elle seule.
+    #
+    # `_harvest_sources` est appelé directement : ce lot ne sert qu'une source,
+    # donc le parsage des critères ne laisse plus passer un `Criteria` à deux
+    # sources. La propriété testée, elle, reste dans le code et c'est elle qui
+    # garde la porte ouverte au jour où une deuxième source entre.
     clock = FakeClock()
     pages = [Page(listings=[listing(page * 20 + index) for index in range(20)]) for page in range(3)]
     sources = {"autoscout24": FakeSource(pages), "autohero": FakeSource(pages)}
     for source in sources.values():
         source.on_search = lambda _criteria, _page: clock.advance(40)
-    mcp = FakeMcp()
-    tools.register(
-        mcp,
-        db_path=tmp_path / "corpus.db",
-        source_factory=lambda name: sources[name],
-        clock=clock,
-    )
-    coverage = harvest(mcp, {"sources": ["autoscout24", "autohero"], "pages_max": 5}, 60)["coverage"]
-    # Un budget global aurait laissé la deuxième source à zéro.
-    assert [(row["source"], row["read"], row["status"]) for row in coverage] == [
+    with Store(tmp_path / "corpus.db") as store:
+        coverage = asyncio.run(
+            tools._harvest_sources(
+                store,
+                "job-budget",
+                Criteria(sources=("autoscout24", "autohero"), pages_max=5),
+                budget=60,
+                criteria_hash="0123456789abcdef",
+                make_source=lambda name: sources[name],
+                clock=clock,
+            )
+        )
+    assert [(row.source, row.read, row.status) for row in coverage] == [
         ("autoscout24", 40, "capped"),
         ("autohero", 40, "capped"),
     ]
@@ -369,12 +557,16 @@ def test_a_challenge_declared_by_the_adapter_is_reported_as_challenge(tmp_path):
     assert "DataDome" in row["reason"]
 
 
-def test_a_source_without_an_adapter_is_reported_not_ignored(tmp_path):
+def test_a_source_outside_this_lot_is_refused_at_parse_time(tmp_path):
+    # `autohero` est au contrat mais hors de ce lot : le refus tombe avant la
+    # première requête et nomme la source. L'accepter pour rendre
+    # `status="error"` une source plus loin ferait passer un périmètre pour une
+    # panne du site, et l'appelant chercherait la panne du mauvais côté.
     mcp = FakeMcp()
     tools.register(mcp, db_path=tmp_path / "corpus.db")  # fabrique réelle
-    row = harvest(mcp, {"sources": ["autohero"]})["coverage"][0]
-    assert row["status"] == "error"
-    assert "hors périmètre" in row["reason"]
+    with pytest.raises(ValueError, match="hors périmètre"):
+        harvest(mcp, {"sources": ["autohero"]})
+    assert not (tmp_path / "corpus.db").exists()  # rien n'a même ouvert le corpus
 
 
 def test_harvest_counts_duplicates_as_dropped(tmp_path):
@@ -382,6 +574,26 @@ def test_harvest_counts_duplicates_as_dropped(tmp_path):
     mcp = install(tmp_path, source)
     row = harvest(mcp, {"pages_max": 5})["coverage"][0]
     assert (row["read"], row["unique"], row["dropped_duplicates"]) == (4, 3, 1)
+
+
+def test_an_intra_page_duplicate_counts_as_dropped(tmp_path):
+    # Une page qui REND une annonce en double : l'adaptateur n'en garde qu'une
+    # (`page.listings`), mais `page.rendered` en compte deux. L'écart entre les
+    # deux est le doublon intra-page, et il doit entrer dans
+    # `dropped_duplicates` — sans quoi l'identité `read == unique +
+    # dropped_duplicates + dropped_invalid` ne se referme plus, et l'annonce
+    # comptée deux fois disparaîtrait des compteurs sans que rien ne le dise.
+    source = FakeSource([Page(listings=[listing(1), listing(2)], rendered=3, announced_total=2)])
+    mcp = install(tmp_path, source)
+    row = harvest(mcp, {"pages_max": 5})["coverage"][0]
+    assert (
+        row["read"],
+        row["unique"],
+        row["dropped_duplicates"],
+        row["dropped_invalid"],
+    ) == (3, 2, 1, 0)
+    assert row["read"] == row["unique"] + row["dropped_duplicates"] + row["dropped_invalid"]
+    assert row["truncated"] is False
 
 
 # --- harvest : critères --------------------------------------------------------
@@ -435,6 +647,28 @@ def test_harvest_refuses_a_budget_below_one_second(tmp_path):
     mcp = install(tmp_path, FakeSource([Page(listings=[])]))
     with pytest.raises(ValueError, match="budget_s"):
         harvest(mcp, {}, 0)
+
+
+def test_harvest_refuses_a_budget_above_the_server_ceiling(tmp_path):
+    # La borne est une propriété du serveur, pas un objectif : au-delà de dix
+    # minutes le client a abandonné depuis longtemps. Sans ce refus, un appel
+    # `budget_s: 10**9` autoriserait une récolte à durer indéfiniment.
+    source = FakeSource([Page(listings=[])])
+    mcp = install(tmp_path, source)
+    with pytest.raises(ValueError, match=str(MAX_BUDGET_S)):
+        harvest(mcp, {}, MAX_BUDGET_S + 1)
+    assert source.search_count == 0  # rien n'est parti sur le réseau
+
+
+def test_harvest_refuses_a_pages_max_above_the_site_ceiling(tmp_path):
+    # MAX_PAGES est le plafond mesuré d'AutoScout24 (20 pages, 400 annonces) :
+    # demander plus boucle pour rien. Le message nomme la borne pour que
+    # l'appelant sache quoi corriger.
+    source = FakeSource([Page(listings=[])])
+    mcp = install(tmp_path, source)
+    with pytest.raises(ValueError, match=str(MAX_PAGES)):
+        harvest(mcp, {"pages_max": MAX_PAGES + 1})
+    assert source.search_count == 0
 
 
 # --- offers -------------------------------------------------------------------
@@ -530,12 +764,100 @@ def test_offers_refuses_a_garbled_cursor(tmp_path):
         mcp.tools["offers"](result["job_id"], "pas-un-curseur", 25)
 
 
+def test_offers_refuses_a_negative_offset(tmp_path):
+    # Le curseur n'est pas scellé : un offset forgé négatif serait lu par SQLite
+    # comme 0, donc il relirait la première page en la faisant passer pour la
+    # suivante. Il est refusé — au décodage du curseur, avant même la garde
+    # d'`offers` ; mesuré, le message est « curseur illisible : offset -1 ».
+    source = FakeSource([Page(listings=[listing(index) for index in range(4)])])
+    mcp = install(tmp_path, source)
+    result = harvest(mcp)
+    entry = decode(result["cursor"])
+    forged = encode(
+        Cursor(
+            job_id=entry.job_id,
+            offset=-1,
+            sort=entry.sort,
+            criteria_hash=entry.criteria_hash,
+        )
+    )
+    with pytest.raises(CursorError, match="illisible.*offset -1"):
+        mcp.tools["offers"](result["job_id"], forged, 2)
+
+
+def test_offers_refuses_an_offset_past_the_corpus(tmp_path):
+    # Un offset au-delà du corpus rendrait une page vide, qui se lirait comme
+    # « la fin de la récolte ». La borne est nommée dans le message.
+    source = FakeSource([Page(listings=[listing(index) for index in range(4)])])
+    mcp = install(tmp_path, source)
+    result = harvest(mcp)
+    entry = decode(result["cursor"])
+    forged = encode(
+        Cursor(
+            job_id=entry.job_id,
+            offset=5,
+            sort=entry.sort,
+            criteria_hash=entry.criteria_hash,
+        )
+    )
+    with pytest.raises(CursorError, match="4 annonce"):
+        mcp.tools["offers"](result["job_id"], forged, 2)
+
+
+def test_offers_at_the_corpus_bound_renders_an_empty_last_page(tmp_path):
+    # Frontière exacte : un offset égal au nombre d'annonces n'est pas une
+    # erreur, c'est la page qui suit la dernière. Il doit rendre vide, avec
+    # `has_more` faux — sinon un client qui pagine jusqu'au bout reçoit une
+    # erreur au lieu d'une fin.
+    source = FakeSource([Page(listings=[listing(index) for index in range(4)])])
+    mcp = install(tmp_path, source)
+    result = harvest(mcp)
+    entry = decode(result["cursor"])
+    forged = encode(
+        Cursor(
+            job_id=entry.job_id,
+            offset=4,
+            sort=entry.sort,
+            criteria_hash=entry.criteria_hash,
+        )
+    )
+    page = mcp.tools["offers"](result["job_id"], forged, 2)
+    assert page["items"] == []
+    assert page["has_more"] is False
+
+
 @pytest.mark.parametrize("limit", [0, -1, 101, True, "25"])
 def test_offers_refuses_a_limit_out_of_bounds(tmp_path, limit):
     mcp = install(tmp_path, FakeSource([Page(listings=[])]))
     result = harvest(mcp)
     with pytest.raises(ValueError, match="limit"):
         mcp.tools["offers"](result["job_id"], None, limit)
+
+
+def test_offers_reads_only_the_db_variable(tmp_path, monkeypatch):
+    # `offers` n'a ni page ni budget à régler : une `MCC_PAGES_MAX` hors bornes
+    # fait lever `load_config()`, et c'est voulu pour `harvest` (c'est un
+    # plafond de récolte). Mais `offers` ne récolte rien : hériter de ce refus
+    # rendrait la lecture d'un corpus déjà écrit impossible à cause d'une
+    # variable qui ne concerne aucune page lue.
+    monkeypatch.setenv("MCC_DB", str(tmp_path / "from-env.db"))
+    mcp = FakeMcp()
+    tools.register(
+        mcp,
+        source_factory=lambda _name: FakeSource(
+            [Page(listings=[listing(1), listing(2)])]
+        ),
+        clock=lambda: 0.0,
+    )
+    result = harvest(mcp, {})
+    monkeypatch.setenv("MCC_PAGES_MAX", str(MAX_PAGES + 1))
+    page = mcp.tools["offers"](result["job_id"], None, 25)
+    assert [item["source_id"] for item in page["items"]] == ["fr-001", "fr-002"]
+    assert page["coverage"]["listings_distinct"] == 2
+    # Le refus existe toujours, et il reste celui de `harvest` : les deux
+    # outils ne doivent pas être confondus sur ce point.
+    with pytest.raises(ValueError, match="MCC_PAGES_MAX"):
+        harvest(mcp, {})
 
 
 def test_offers_never_builds_a_source(tmp_path):

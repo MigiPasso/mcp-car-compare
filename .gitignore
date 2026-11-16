@@ -4,6 +4,16 @@ __pycache__/
 .venv/
 *.db
 *.db-journal
+# `Store` force `journal_mode=WAL` : un corpus local (`MCC_DB=./corpus.db`)
+# laisse `corpus.db-wal` et `corpus.db-shm` à côté de lui, et ces deux noms ne
+# matchent ni `*.db` ni `*.db-journal`.
+*.db-wal
+*.db-shm
+# La même règle vaut pour un corpus nommé en `.sqlite` : `README.md` documente ce
+# nom, donc l'exclusion doit le couvrir aussi, side-cars compris.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 /data/
 /profile/
 .env

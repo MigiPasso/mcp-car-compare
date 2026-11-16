@@ -19,8 +19,12 @@ sous-processus et vérifie quatre choses qu'aucun test unitaire ne peut voir :
    Le validateur est testé contre des lignes fautives connues au démarrage
    (`_self_test_validator`), sinon un validateur devenu no-op passerait ce test
    en ne refusant jamais rien.
-4. `stderr` n'est pas vide : c'est la preuve que les logs partent bien là où
-   ils ne gênent pas le protocole.
+4. **Le niveau de log ne change rien à la pureté de stdout.** Le scénario est
+   rejoué avec `MCC_LOG_LEVEL=INFO` puis `MCC_LOG_LEVEL=WARNING`, où le serveur
+   ne journalise plus rien : un protocole correct doit passer les deux fois.
+   C'est la propriété du protocole, pas un proxy comme « stderr n'est pas
+   vide » — ce dernier échouait sur un serveur parfait dès que le niveau de log
+   le rendait silencieux, et ne prouvait donc rien sur stdout.
 
 **Aucun appel réseau par défaut.** `list_brands` délègue à l'adaptateur et fait
 un GET réel (~0,5 s) : une table de marques figée dériverait en silence. Un
@@ -52,6 +56,10 @@ PROTOCOL_VERSION = "2025-06-18"
 TIMEOUT_S = 60.0
 EXPECTED_TOOLS = ("list_brands", "harvest", "offers")
 MAX_MESSAGES = 200
+# Les deux extrêmes de verbosité du serveur : `INFO` journalise une ligne au
+# démarrage, `WARNING` n'en journalise aucune. Le protocole doit sortir intact
+# des deux, sinon la preuve dépend d'un réglage au lieu de dépendre du code.
+LOG_LEVELS = ("INFO", "WARNING")
 # Identifiant de récolte qui ne peut pas exister : le scénario par défaut doit
 # rester hors réseau, donc il ne récolte rien et interroge un corpus vide.
 UNKNOWN_JOB_ID = "smoke-job-inexistant"
@@ -367,12 +375,27 @@ def _with_stderr(failure: SmokeFailure, server: ServerUnderTest) -> SmokeFailure
 
 
 def run_smoke(*, with_list_brands: bool = False) -> list[str]:
-    """Exécute le scénario et rend les lignes de compte rendu.
+    """Exécute le scénario à chaque niveau de log et rend les lignes de compte rendu.
 
     `with_list_brands` est le seul chemin qui sort du conteneur : il interroge
-    AutoScout24 pour de vrai et n'est donc pas dans la preuve par défaut.
+    AutoScout24 pour de vrai et n'est donc pas dans la preuve par défaut. Il
+    n'est joué qu'une fois, à la première passe : deux GET réels n'ajouteraient
+    rien à la preuve et taperaient le site deux fois.
     """
     _self_test_validator()
+    report: list[str] = []
+    for level in LOG_LEVELS:
+        report.extend(
+            _protocol_round(
+                level,
+                with_list_brands=with_list_brands and level == LOG_LEVELS[0],
+            )
+        )
+    return report
+
+
+def _protocol_round(log_level: str, *, with_list_brands: bool) -> list[str]:
+    """Un tour complet du protocole, à un niveau de log donné."""
     report: list[str] = []
 
     repo = Path(__file__).resolve().parents[1]
@@ -385,7 +408,9 @@ def run_smoke(*, with_list_brands: bool = False) -> list[str]:
     # La base va sous /tmp, jamais dans le dépôt ni sur le défaut de l'image
     # (/data, qui n'existe pas hors conteneur).
     env["MCC_DB"] = str(workdir / "corpus.db")
-    env.pop("MCC_LOG_LEVEL", None)
+    # Le niveau est POSÉ, pas hérité : c'est ce qui fait de cette passe une
+    # preuve et pas une dépendance à l'environnement de l'opérateur.
+    env["MCC_LOG_LEVEL"] = log_level
 
     server = ServerUnderTest(env, workdir)
     body_failure: SmokeFailure | None = None
@@ -406,7 +431,7 @@ def run_smoke(*, with_list_brands: bool = False) -> list[str]:
         if not isinstance(init.get("serverInfo"), dict):
             raise SmokeFailure(f"initialize sans `serverInfo` : {init!r}"[:400])
         report.append(
-            f"initialize: {init['serverInfo'].get('name')} "
+            f"initialize [{log_level}]: {init['serverInfo'].get('name')} "
             f"protocole {init.get('protocolVersion')}"
         )
 
@@ -425,7 +450,10 @@ def run_smoke(*, with_list_brands: bool = False) -> list[str]:
         missing = [name for name in EXPECTED_TOOLS if name not in names]
         if missing:
             raise SmokeFailure(f"outils de la v1 absents de tools/list : {missing} (reçus : {names})")
-        report.append(f"tools/list: {len(tools)} outils — {', '.join(str(n) for n in names)}")
+        report.append(
+            f"tools/list [{log_level}]: {len(tools)} outils — "
+            f"{', '.join(str(n) for n in names)}"
+        )
 
         server.send(
             {
@@ -447,7 +475,9 @@ def run_smoke(*, with_list_brands: bool = False) -> list[str]:
                     "offers sur un job_id inconnu a rendu une erreur sans message : "
                     "l'appelant n'a rien à lire, et rien à corriger"
                 )
-            report.append(f"tools/call offers(job_id inconnu): erreur lisible — {message[:160]}")
+            report.append(
+                f"tools/call offers(job_id inconnu) [{log_level}]: erreur lisible — {message[:160]}"
+            )
         else:
             payload = _json_payload(offered)
             if not isinstance(payload, dict) or "coverage" not in payload:
@@ -456,10 +486,22 @@ def run_smoke(*, with_list_brands: bool = False) -> list[str]:
                     + json.dumps(payload, ensure_ascii=False)[:400]
                 )
             coverage = payload.get("coverage")
-            corpus = coverage.get("corpus", {}) if isinstance(coverage, dict) else {}
+            # Les deux compteurs du corpus, à la racine du bloc (PLAN.md §5).
+            # L'ancienne version lisait une clé `corpus` que le code n'émet
+            # jamais : une assertion qui ne peut pas passer ne prouve rien, et
+            # une assertion sur une clé inventée ne prouve rien non plus.
+            if not isinstance(coverage, dict) or not {
+                "listings_distinct",
+                "runs",
+            } <= set(coverage):
+                raise SmokeFailure(
+                    "le bloc `coverage` rendu par offers n'a pas `listings_distinct` "
+                    f"et `runs` : {json.dumps(coverage, ensure_ascii=False)[:400]}"
+                )
             report.append(
-                "tools/call offers(job_id inconnu): couverture nulle "
-                f"({corpus.get('listings_distinct')} annonce(s) distincte(s))"
+                f"tools/call offers(job_id inconnu) [{log_level}]: couverture nulle "
+                f"({coverage['listings_distinct']} annonce(s) distincte(s), "
+                f"{coverage['runs']} récolte(s))"
             )
 
         # Le serveur doit avoir survécu à l'appel précédent : c'est la preuve
@@ -467,7 +509,7 @@ def run_smoke(*, with_list_brands: bool = False) -> list[str]:
         server.send({"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}})
         if not isinstance(server.wait_for_response(4), dict):
             raise SmokeFailure("ping n'a pas rendu un objet JSON-RPC vide")
-        report.append("ping après l'appel: serveur vivant")
+        report.append(f"ping après l'appel [{log_level}]: serveur vivant")
 
         if with_list_brands:
             # Hors preuve de contrat : liste ou erreur, les deux passent. Ce
@@ -510,17 +552,19 @@ def run_smoke(*, with_list_brands: bool = False) -> list[str]:
     if code != 0:
         raise SmokeFailure(f"le serveur a quitté avec le code {code} après la fermeture de stdin")
     report.append(
-        f"stdout: {server.reader.lines_read} ligne(s), {server.reader.bytes_read} octet(s), "
-        "toutes JSON-RPC"
+        f"stdout [{log_level}]: {server.reader.lines_read} ligne(s), "
+        f"{server.reader.bytes_read} octet(s), toutes JSON-RPC"
     )
 
+    # stderr est LU et compté, jamais exigé : son contenu dépend du niveau de
+    # log, pas de la correction du serveur. Un `WARNING` silencieux est un
+    # serveur correct ; exiger une ligne ici ferait échouer ce cas et
+    # n'apprendrait rien sur stdout, qui est le canal du protocole.
     stderr = server.stderr_text()
-    if not stderr.strip():
-        raise SmokeFailure(
-            "stderr est vide : les logs ne partent donc pas sur stderr "
-            "(ou le serveur ne journalise rien, et une panne serait muette)"
-        )
-    report.append(f"stderr: {len(stderr.splitlines())} ligne(s) de log")
+    report.append(
+        f"stderr [{log_level}]: {len(stderr.splitlines())} ligne(s) — informatif, "
+        "le critère est stdout"
+    )
     return report
 
 

@@ -29,8 +29,22 @@ RUN chmod +x ./entrypoint.sh
 # corpus SQLite doit survivre à `docker run --rm`, sinon le curseur de reprise
 # et la réutilisation du corpus entre appels — la raison d'être de la base —
 # disparaissent à chaque conteneur.
-RUN mkdir -p /data
+#
+# Ce conteneur ne tourne pas en root, parce que le corpus s'écrit dans /data :
+# une base créée par root appartient à root sur l'hôte, et le prochain
+# conteneur lancé avec un autre uid (`-u $(id -u)`), ou simplement l'opérateur
+# qui veut lire le fichier, ne peut plus l'écrire. L'UID est fixe (10001) pour
+# que ce propriétaire soit le même d'une reconstruction à l'autre ; /data lui
+# appartient, donc SQLite crée `corpus.db` et son journal WAL sans privilège.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin mcc \
+    && mkdir -p /data \
+    && chown mcc:mcc /data
 VOLUME ["/data"]
+
+# `USER` après le `chown` et avant l'entrypoint : le serveur, et lui seul, hérite
+# de cet uid. `entrypoint.sh` garde son `exec`, qui est ce qui transmet SIGTERM
+# au serveur au lieu de laisser un shell PID 1 l'ignorer.
+USER mcc
 
 # Pas de HEALTHCHECK, et c'est un choix : ce conteneur ne parle ni HTTP ni TCP,
 # il parle JSON-RPC sur stdin/stdout, donc il n'y a pas de port à interroger ici.
@@ -49,4 +63,7 @@ VOLUME ["/data"]
 # S'il fallait vraiment un check, ce serait celui-là, avec une sonde MCP qui
 # fait `initialize` puis `tools/list` : un client tiers, pas une simple socket.
 
+# `chmod +x` plus haut est fait en root (les couches précédentes le sont),
+# puis `USER mcc` : le serveur tourne non privilégié, et `id -u` dans
+# l'image rend 10001 — c'est la preuve de cette directive.
 ENTRYPOINT ["./entrypoint.sh"]

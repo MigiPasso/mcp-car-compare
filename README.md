@@ -18,7 +18,7 @@ docker build -t mcp-car-compare .
 docker run --rm --interactive --volume mcp-car-compare-data:/data mcp-car-compare
 ```
 
-Deux détails du `docker run` ne sont pas décoratifs :
+Trois détails du `docker run` ne sont pas décoratifs :
 
 - **`--interactive` est obligatoire.** Le serveur lit ses requêtes sur stdin ;
   sans `-i`, Docker ferme stdin, le serveur voit EOF et s'arrête aussitôt. Un
@@ -29,6 +29,12 @@ Deux détails du `docker run` ne sont pas décoratifs :
 - Le volume porte `/data` : sans lui, `docker run --rm` efface le corpus, donc
   le curseur de reprise et la réutilisation entre appels — la raison d'être de
   la base.
+
+L'image tourne sous un utilisateur non privilégié (`mcc`, uid 10001) et `/data`
+lui appartient : le corpus n'est donc pas créé par `root` dans le volume. Avec un
+volume nommé, rien à faire. Avec un **bind mount** (`-v /un/chemin:/data`), c'est
+le propriétaire du répertoire de l'hôte qui compte : donnez-lui l'uid 10001
+(`chown 10001 /un/chemin`) ou lancez le conteneur avec `--user "$(id -u):$(id -g)"`.
 
 ## Preuve E0 : stdout ne contient que du JSON-RPC
 
@@ -54,17 +60,27 @@ et enfin **relit chaque octet de stdout comme du JSON-RPC** : une barre de
 progression, un `print` oublié ou un avertissement de bibliothèque font échouer
 le test ici, pas chez l'utilisateur en pleine session. Il exige aussi trois
 outils, une réponse structurée pour l'identifiant inconnu (erreur lisible ou
-couverture à zéro, jamais un crash), un serveur encore vivant après cet appel,
-et un `stderr` non vide. Sortie attendue :
+couverture à zéro, jamais un crash) et un serveur encore vivant après cet appel.
+
+Le scénario est rejoué **deux fois**, avec `MCC_LOG_LEVEL=INFO` puis
+`MCC_LOG_LEVEL=WARNING` : un serveur correct doit rendre le même stdout intact
+aux deux niveaux. C'est la propriété du protocole ; l'ancienne assertion
+« `stderr` n'est pas vide » n'en était qu'un proxy et échouait sur un serveur
+parfait dès que le niveau de log le rendait silencieux. `stderr` est donc
+compté et affiché, jamais exigé. Sortie attendue :
 
 ```
 SMOKE OK — preuve E0
-  initialize: mcp-car-compare protocole 2025-06-18
-  tools/list: 3 outils — list_brands, harvest, offers
-  tools/call offers(job_id inconnu): erreur lisible — …récolte inconnue : 'smoke-job-inexistant'
-  ping après l'appel: serveur vivant
-  stdout: 4 ligne(s), N octet(s), toutes JSON-RPC
-  stderr: N ligne(s) de log
+  initialize [INFO]: mcp-car-compare protocole 2025-06-18
+  tools/list [INFO]: 3 outils — list_brands, harvest, offers
+  tools/call offers(job_id inconnu) [INFO]: erreur lisible — …récolte inconnue : 'smoke-job-inexistant'
+  ping après l'appel [INFO]: serveur vivant
+  stdout [INFO]: 4 ligne(s), N octet(s), toutes JSON-RPC
+  stderr [INFO]: N ligne(s) — informatif, le critère est stdout
+  initialize [WARNING]: …
+  …
+  stdout [WARNING]: 4 ligne(s), N octet(s), toutes JSON-RPC
+  stderr [WARNING]: 0 ligne(s) — informatif, le critère est stdout
 ```
 
 **Aucun appel réseau par défaut**, et c'est une décision : `list_brands` fait un
@@ -120,7 +136,7 @@ stdio : rien d'autre à configurer, aucun port, aucun jeton.
 
 | Outil | Arguments | Rend |
 |---|---|---|
-| `list_brands` | `source?` | `{source, brands: [{value, label, models: […]}]}` — un **GET réel** chez le site (~0,5 s), aucun `coverage` (aucune récolte) ; un site en échec rend `error` et `brands` vide, l'outil ne lève pas |
+| `list_brands` | `source?` (`autoscout24`), `market?` (`fr` ou `de`) | `{source, market, brands: [{value, label}], error}` — un **GET réel** chez le site (~0,5 s), aucun `coverage` (aucune récolte) ; un site en échec rend `error` et `brands` vide, l'outil ne lève pas. `market` compte : les identifiants de marque de `.fr` ne filtrent rien sur `.de`. `models` **n'est pas rempli en v1** : la taxonomie ne porte les modèles d'une marque que sur une page déjà filtrée sur elle, donc la clé est absente plutôt que présente et toujours vide |
 | `harvest` | `criteria`, `budget_s`, `sources?` | `{job_id, coverage, cursor}` — une ligne de `coverage` par source, celle de **cette** récolte |
 | `offers` | `job_id`, `cursor?`, `limit` | `{items, next_cursor, has_more, coverage}` — le corpus, jamais la somme des récoltes |
 
@@ -137,6 +153,13 @@ stdio : rien d'autre à configurer, aucun port, aucun jeton.
 - `announced_total` peut être `null` quand le site se tait. L'absence est dite,
   pas comblée par `len(items)`.
 
+`sources` n'accepte que ce que ce lot sait interroger (`autoscout24`) : toute
+autre source du plan (`autohero`, `lacentrale`) est **refusée au parsage des
+critères**, par une erreur qui nomme la source et celles servies. C'est dit
+avant la première requête et non rendu en `status: "error"`, parce qu'un client
+lirait « autohero a échoué » là où la vérité est « autohero n'est pas
+implémentée ».
+
 ## Configuration
 
 Tout par variables d'environnement, préfixe `MCC_`, lues **à chaque appel**
@@ -146,9 +169,13 @@ d'exécution).
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `MCC_DB` | `/data/corpus.db` | Fichier SQLite du corpus |
-| `MCC_BUDGET_S` | `60` | Budget par source quand l'appelant n'en donne pas |
-| `MCC_PAGES_MAX` | `5` | Plafond de pages par source |
+| `MCC_BUDGET_S` | `60` | Budget par source quand l'appelant n'en donne pas (entier ≥ 1, au plus `600`) |
+| `MCC_PAGES_MAX` | `5` | Plafond de pages par source (entier ≥ 1, au plus `20`, le plafond du site) |
 | `MCC_LOG_LEVEL` | `INFO` | Niveau des logs (sur stderr) |
+
+Une valeur illisible, nulle, négative ou au-dessus du plafond est **refusée en
+nommant la variable**, jamais rabattue sur le défaut : `MCC_PAGES_MAX=0` n'est
+pas « aucune page » mais une récolte qui ne lit rien en ayant l'air de tourner.
 
 Aucun secret, aucune clé d'API, aucun fichier de credentials : le corpus est un
 fichier local. Il ne doit jamais y en avoir, et `.dockerignore` refuse déjà
@@ -177,22 +204,53 @@ fichier local. Il ne doit jamais y en avoir, et `.dockerignore` refuse déjà
 ## Développer
 
 ```sh
-# tests unitaires (parseurs, corpus, curseur) — aucune requête réseau :
-# les adaptateurs reçoivent un transport httpx factice
+# l'image de test : même base que l'image de production, plus pytest, plus
+# `tests/` (construite une fois, la suite se relance en une seconde)
+docker build -f Dockerfile.test -t mcp-car-compare:test .
+docker run --rm mcp-car-compare:test
+
+# preuve du transport stdio (aucun réseau)
+docker run --rm mcp-car-compare:test python tests/smoke_stdio.py
+```
+
+`docker run --rm mcp-car-compare:test` imprime le compte de tests passé :
+`Dockerfile.test` porte `tests/`, `pyproject.toml` (pour `pythonpath`) et
+`-p no:cacheprovider`, donc rien n'a besoin d'être monté — **à une condition
+lue plus bas** : après avoir touché un test, c'est la commande par montage qui
+fait foi. `Dockerfile.test` et
+`Dockerfile` partagent le même `.dockerignore`, qui n'exclut **pas** `tests/` ni
+`requirements-dev.txt` : un `.dockerignore` vaut pour tous les builds du
+répertoire, et les exclure casserait l'image de test en silence.
+
+**Cette image fige `tests/` au moment du build** (`COPY tests/`). Une image non
+reconstruite rend donc un vert qui ne voit pas une modification de test :
+mesuré, un test ajouté sans rebuild donne « 211 passed », et le même test après
+`docker build` échoue. La commande **autoritaire** est celle qui monte le dépôt
+(ci-dessous) — c'est elle qui lit l'arbre de travail ; l'image de test est un
+raccourci pour itérer sur `src/`, pas une preuve de la suite. Après avoir touché
+un test, il faut soit `docker build`, soit le montage.
+
+Les tests peuvent aussi se lancer depuis un conteneur jetable qui monte le
+dépôt, sans construire d'image :
+
+```sh
+# l'image de test déjà construite, mais le dépôt monté : c'est l'arbre de
+# travail qui tourne, sans rebuild et sans réinstaller les dépendances
+docker run --rm --volume "$PWD":/app --workdir /app -e PYTHONDONTWRITEBYTECODE=1 \
+  mcp-car-compare:test python -m pytest -q -p no:cacheprovider
+
+# la même chose depuis l'image de base, quand aucune image de test n'existe
 docker run --rm --volume "$PWD":/app --workdir /app -e PYTHONDONTWRITEBYTECODE=1 \
   python:3.12-slim \
   sh -c 'pip install -q -r requirements-dev.txt && python -m pytest -p no:cacheprovider'
-
-# preuve du transport stdio
-docker run --rm --volume "$PWD":/app --workdir /app -e PYTHONDONTWRITEBYTECODE=1 \
-  python:3.12-slim \
-  sh -c 'pip install -q -r requirements-dev.txt && python tests/smoke_stdio.py'
 ```
 
-`PYTHONDONTWRITEBYTECODE=1` et `-p no:cacheprovider` ne sont pas des détails :
-le conteneur tourne en `root`, et sans eux l'arbre monté se remplit de
-`__pycache__` et de `.pytest_cache` appartenant à `root`, que le prochain
-`pytest` lancé depuis l'hôte ne peut plus écrire.
+`PYTHONDONTWRITEBYTECODE=1` et `-p no:cacheprovider` ne sont pas des détails
+dans cette variante : le conteneur tourne en `root`, et sans eux l'arbre monté
+se remplit de `__pycache__` et de `.pytest_cache` appartenant à `root`, que le
+prochain `pytest` lancé depuis l'hôte ne peut plus écrire. L'image de test, elle,
+ne monte rien : les tests y sont copiés, donc aucun artefact ne peut atterrir
+dans l'arbre.
 
 Tout s'exécute dans Docker, y compris les tests : la différence de version de
 Python entre l'hôte et l'image est exactement le genre d'écart qui ne se voit

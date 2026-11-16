@@ -1,9 +1,19 @@
-"""Curseur de pagination : opaque pour l'appelant, refusé s'il ne s'applique plus.
+"""Curseur de pagination : opaque par convention, refusé s'il ne s'applique plus.
 
-Un curseur porte `{job_id, offset, sort, criteria_hash}` encodé en base64. Il
-n'est pas lisible par l'appelant (c'est voulu : sa forme interne doit pouvoir
-changer), et le serveur le **refuse** plutôt que de rendre des pages
-incohérentes quand le tri ou les critères du corpus ont changé (PLAN.md §8).
+Un curseur porte `{job_id, offset, sort, criteria_hash}` encodé en base64 URL.
+Il n'est ni chiffré ni signé : n'importe qui peut le relire (`base64` n'est pas
+une serrure) et en forger un autre. « Opaque » veut donc dire ceci, et pas
+davantage : l'appelant doit le traiter comme un jeton dont la forme interne peut
+changer sans préavis, pas comme une valeur qu'il peut fabriquer. Ce n'est pas
+une garantie cryptographique, et le code qui s'appuie dessus ne doit rien en
+affirmer de plus.
+
+Ce que le jeton ne protège pas est borné là où il est relu : le serveur le
+**refuse** plutôt que de rendre des pages incohérentes quand le tri ou les
+critères du corpus ont changé (PLAN.md §8). Un `offset` négatif est refusé dès
+le décodage (`decode`, plus bas) ; un `offset` plus grand que le corpus ne peut
+l'être qu'ici, parce que seul `tools.offers` connaît la taille du corpus — il le
+refuse en la nommant.
 
 `criteria_hash` porte tous les champs qui changent le résultat d'une récolte,
 `budget_s` compris : deux récoltes du même critère avec des budgets différents
@@ -48,7 +58,7 @@ class Cursor:
 
 
 def encode(cursor: Cursor) -> str:
-    """Rend un curseur opaque, sans remplissage `=` (il passe dans une URL)."""
+    """Encode un curseur, sans remplissage `=` (il passe dans une URL)."""
     payload = json.dumps(cursor.as_dict(), sort_keys=True, separators=(",", ":"))
     return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
 

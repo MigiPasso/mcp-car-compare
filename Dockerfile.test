@@ -1,0 +1,42 @@
+# Image de test : la même base que `Dockerfile`, plus pytest, plus `tests/`.
+#
+# Elle existe pour que la suite tourne dans l'environnement de l'image (même
+# version de Python, mêmes dépendances d'exécution) sans monter le dépôt ni
+# `pip install` à chaque lancement :
+#
+#     docker build -f Dockerfile.test -t mcp-car-compare:test .
+#     docker run --rm mcp-car-compare:test
+#
+# Elle n'est PAS l'image de production : elle contient les fixtures et pytest,
+# et son `CMD` est la suite de tests, pas le serveur MCP. Elle tourne en root, et
+# c'est sans conséquence ici : le code de test est copié dans l'image, jamais
+# monté, donc aucun artefact ne peut atterrir dans l'arbre de l'hôte.
+FROM python:3.12-slim
+
+# `PYTHONDONTWRITEBYTECODE=1` : une image de test qui laisse des `__pycache__`
+# n'a aucun intérêt, et le `-p no:cacheprovider` du CMD fait le pendant pour
+# `.pytest_cache`. `PYTHONPATH=/app/src` est le même chemin que `Dockerfile`
+# (le paquet n'est pas installé) ; `pyproject.toml` le déclare aussi, pour un
+# `pytest` lancé depuis /app avec un autre interpréteur.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# requirements-dev.txt porte `-r requirements.txt` : les deux fichiers sont donc
+# nécessaires, et l'installation des dépendances reste un calque séparé du code.
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+# `pyproject.toml` porte `pythonpath` et `testpaths` ; sans lui, `pytest` lancé
+# depuis /app ne trouverait ni le paquet ni les tests.
+COPY pyproject.toml ./
+COPY src/ ./src/
+COPY tests/ ./tests/
+
+# `-p no:cacheprovider` : pas de `.pytest_cache` dans l'image. La sortie de
+# `-q` finit par « N passed », c'est le chiffre que la preuve cite.
+CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]

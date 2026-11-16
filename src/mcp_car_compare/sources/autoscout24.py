@@ -66,6 +66,32 @@ ACCEPT_LANGUAGE = {
 # du site : elle est ignorée plutôt que recopiée en base.
 IMAGE_HOST = "prod.pictures.autoscout24.net"
 
+# MAX_BODY_BYTES plafonne le corps d'une réponse PENDANT sa lecture. Une page de
+# résultats pèse ~686 Ko (PLAN.md §2) ; 4 Mio laissent donc six fois la marge
+# d'une page légitime. Sans plafond, une réponse d'erreur de plusieurs centaines
+# de Mo occuperait la mémoire du serveur avant qu'on puisse la refuser, et
+# `response.text` la chargerait entièrement sans broncher.
+MAX_BODY_BYTES = 4 << 20
+
+# BODY_TIMEOUT_S borne la lecture d'un corps dans le TEMPS, en plus des octets.
+# Le délai de `httpx` se réinitialise à chaque morceau reçu : une source qui
+# envoie un octet toutes les 29 s garde la lecture ouverte indéfiniment, et le
+# budget de `harvest` n'y voit rien puisqu'il n'est testé qu'entre deux pages.
+# 30 s est le délai d'une page entière déjà retenu côté outils (tools.py) ; une
+# page légitime arrive en 0,3 s.
+BODY_TIMEOUT_S = 30.0
+
+# CHALLENGE_MARKER reconnaît une page de DÉFI anti-bot, qui n'est ni une casse
+# de structure ni un « aucune annonce ». `captcha-delivery.com` est l'hôte de
+# l'iframe du défi DataDome, le seul anti-bot mesuré sur les sources du
+# périmètre (PLAN.md §2, LaCentrale). Aucune capture d'un défi AutoScout24
+# n'existe dans ce dépôt : une page de défi d'une autre forme reste donc une
+# `StructureChanged` — bruyante, jamais silencieuse.
+#
+# Il ne se cherche que sur le chemin d'échec (statut non-200) ou sur une page
+# sans `__NEXT_DATA__` : voir `_raise_if_challenge`.
+CHALLENGE_MARKER = "captcha-delivery.com"
+
 # FUEL_PARAMS traduit le carburant du contrat en code du site. Les quatre codes
 # sont MESURÉS le 2026-11-12, une requête à la fois, sur une requête de
 # référence .fr : `fuel=B` rend 20 « Essence », `fuel=D` des diesel, `fuel=E`
@@ -144,9 +170,16 @@ def normalize_group(label: str) -> str:
     return words
 
 
-def image_url(raw: str) -> str:
+def image_url(raw: object) -> str:
     """Valide une adresse de vignette : HTTPS, et hôte exactement `IMAGE_HOST`
-    ou l'un de ses sous-domaines. Sinon `""`."""
+    ou l'un de ses sous-domaines. Sinon `""`.
+
+    Le type est vérifié AVANT `strip()` : une vignette d'un autre type (un
+    nombre, un objet) faisait lever `AttributeError` dans le parsage et coûtait
+    la page entière — vingt annonces perdues pour une vignette.
+    """
+    if not isinstance(raw, str):
+        return ""
     try:
         parsed = httpx.URL(raw.strip())
     except (httpx.InvalidURL, TypeError):
@@ -231,6 +264,56 @@ def _market_of(criteria: Criteria) -> str:
     if len(markets) != 1:
         raise SourceError(f"un seul marché par page : {len(markets)} demandé(s) {markets!r}")
     return markets[0]
+
+
+async def _read_bounded(
+    response: httpx.Response, url: str, timeout_s: float = BODY_TIMEOUT_S
+) -> bytes:
+    """Corps de la réponse, plafonné PENDANT la lecture, en octets et en temps.
+
+    `response.text` charge un corps entier sans borne : une réponse d'erreur de
+    plusieurs centaines de Mo occuperait la mémoire du serveur avant qu'on ne
+    puisse la refuser. Le plafond d'octets s'applique donc au fil de l'eau, et
+    il nomme l'URL pour qu'un refus se lise sans deviner quelle requête a
+    échoué.
+
+    Le plafond de temps est le second : le délai de `httpx` repart à zéro à
+    chaque morceau, donc une source qui goûte ses octets tient la lecture
+    ouverte sans fin. Le dépassement lève `SourceError` plutôt que
+    `TimeoutError` : ce n'est pas le budget de la récolte qui a coupé, c'est le
+    site qui n'a pas envoyé sa page.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        async with asyncio.timeout(timeout_s):
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_BODY_BYTES:
+                    raise SourceError(
+                        f"lecture de {url} : corps de plus de {MAX_BODY_BYTES} octets, refusé"
+                    )
+                chunks.append(chunk)
+    except TimeoutError:
+        raise SourceError(
+            f"lecture de {url} : corps non reçu en entier dans {timeout_s:g} s "
+            f"({total} octet(s) reçus), refusé"
+        ) from None
+    return b"".join(chunks)
+
+
+def _decode(body: bytes, response: httpx.Response) -> str:
+    """Décode le corps selon le jeu de caractères annoncé.
+
+    Une lecture en flux ne remplit pas `response.text` ; on décode donc ici, en
+    gardant le comportement de `httpx` : le jeu de caractères déclaré fait foi,
+    UTF-8 par défaut, et un octet isolé ne fait pas perdre la page entière.
+    """
+    charset = response.charset_encoding or "utf-8"
+    try:
+        return body.decode(charset, "replace")
+    except LookupError:  # jeu de caractères annoncé mais inconnu de Python
+        return body.decode("utf-8", "replace")
 
 
 def _int_or_none(value: object) -> int | None:
@@ -389,17 +472,22 @@ def parse_search_page(body: str, market: str, page_number: int = 1) -> Page:
         listings=_dedupe(listings),
         announced_total=announced_total,
         page_number=max(page_number, 1),
+        # Ce que la page a rendu, avant dédoublonnage : c'est ce chiffre que
+        # `coverage.read` compte. La différence avec `len(page.listings)` est le
+        # nombre de doublons internes, que la récolte ajoute à
+        # `dropped_duplicates`.
+        rendered=len(listings),
     )
 
 
 def parse_brands(body: str) -> list[dict]:
     """Lit la taxonomie embarquée dans une page de résultats.
 
-    Les marques viennent de `pageProps.taxonomy.makesSorted`, et leurs modèles
-    de `taxonomy.models`, indexé par la valeur de la marque. La taxonomie ne
-    porte les modèles d'une marque que sur une page filtrée sur cette marque :
-    une liste vide d'ici veut donc dire « cette page ne les portait pas », pas
-    « cette marque n'a pas de modèles ».
+    Les marques viennent de `pageProps.taxonomy.makesSorted`. Les modèles sont
+    délibérément ABSENTS de la forme : la taxonomie ne les porte que sur une page
+    filtrée sur la marque, et mesuré en production `list_brands` rend 301 marques
+    et 0 modèle. Un champ toujours vide est une promesse creuse ; il est retiré
+    plutôt que rempli à moitié (décision D6).
     """
     page_props = _page_props(body)
     taxonomy = page_props.get("taxonomy")
@@ -408,28 +496,35 @@ def parse_brands(body: str) -> list[dict]:
     makes = taxonomy.get("makesSorted")
     if not isinstance(makes, list) or not makes:
         raise StructureChanged("taxonomie sans makesSorted : structure changée")
-    models = taxonomy.get("models")
-    models = models if isinstance(models, dict) else {}
     brands: list[dict] = []
     for make in makes:
         if not isinstance(make, dict):
             raise StructureChanged(
                 f"marque illisible : {type(make).__name__} au lieu d'un objet"
             )
-        value = str(make.get("value") or "")
-        listed = models.get(value)
         brands.append(
             {
-                "value": value,
+                "value": str(make.get("value") or ""),
                 "label": make.get("label") or "",
-                "models": [
-                    {"value": str(model.get("value") or ""), "label": model.get("label") or ""}
-                    for model in listed or []
-                    if isinstance(model, dict)
-                ],
             }
         )
     return brands
+
+
+def _raise_if_challenge(text: str, url: str, status_code: int) -> None:
+    """Lève `SourceError(status="challenge")` si ce corps est un défi anti-bot.
+
+    Appelé UNIQUEMENT sur les deux chemins où un défi est possible : un statut
+    non-200, ou un corps sans `__NEXT_DATA__`. Une page 200 qui porte sa charge
+    n'est jamais jugée sur son texte : `CHALLENGE_MARKER` est une chaîne, et une
+    annonce peut la contenir (un lien, une description) — la 200 valide est une
+    annonce légitime, pas un défi.
+    """
+    if CHALLENGE_MARKER in text.lower():
+        raise SourceError(
+            f"défi anti-bot sur {url} (statut {status_code}) : aucune annonce lue",
+            status="challenge",
+        )
 
 
 class Autoscout24:
@@ -438,13 +533,20 @@ class Autoscout24:
     Le client HTTP est INJECTÉ et jamais créé ici : les tests passent un
     `httpx.MockTransport`, et aucun test ne touche le réseau.
 
-    `market` ne sert qu'à `brands()`, que le Protocol `Source` appelle sans
-    argument ; `search()` prend son marché dans `criteria.markets` et refuse
-    d'en recevoir plusieurs (une `Page` est celle d'un marché).
+    `market` est celui des deux usages qui n'ont pas de marché dans leurs
+    arguments : `brands()`, que le Protocol `Source` appelle sans argument.
+    `search()` prend son marché dans `criteria.markets` et refuse d'en recevoir
+    plusieurs (une `Page` est celle d'un marché). Le marché de `brands()` compte
+    : les identifiants de marque et de modèle sont propres à chaque marketplace,
+    donc un `list_brands` bâti sur `.fr` rend des identifiants inutilisables
+    contre `.de`.
 
     La cadence est tenue par l'instance : `pause_s` entre deux requêtes, jamais
     avant la première. `clock` et `sleep` sont injectables pour que les tests
-    éprouvent cet espacement sans horloge réelle.
+    éprouvent cet espacement sans horloge réelle. `body_timeout_s` borne la
+    lecture d'un corps dans le temps (voir `_read_bounded`) et s'injecte pour la
+    même raison : un corps qui goûte ses octets doit être coupé sans attendre
+    trente secondes réelles.
     """
 
     source = SOURCE_NAME
@@ -455,6 +557,7 @@ class Autoscout24:
         market: str = "fr",
         *,
         pause_s: float = PAGE_PAUSE_S,
+        body_timeout_s: float = BODY_TIMEOUT_S,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -462,6 +565,7 @@ class Autoscout24:
         self.market = market
         self._client = client
         self._pause_s = pause_s
+        self._body_timeout_s = body_timeout_s
         self._clock = clock
         self._sleep = sleep
         self._last_request_at: float | None = None
@@ -478,7 +582,7 @@ class Autoscout24:
         return parse_search_page(body, market, page_number)
 
     async def brands(self) -> list[dict]:
-        """Marques du marché de l'instance, avec les modèles que la page porte."""
+        """Marques du marché de l'instance."""
         url = f"{market_base(self.market)}/lst?atype=C"
         body = await self._get(url, self.market)
         return parse_brands(body)
@@ -486,22 +590,37 @@ class Autoscout24:
     async def _get(self, url: str, market: str) -> str:
         await self._wait_turn()
         try:
-            response = await self._client.get(
+            async with self._client.stream(
+                "GET",
                 url,
                 headers={
                     "User-Agent": USER_AGENT,
                     "Accept-Language": ACCEPT_LANGUAGE[market],
                 },
-            )
+            ) as response:
+                status_code = response.status_code
+                body = await _read_bounded(response, url, self._body_timeout_s)
+                text = _decode(body, response)
         except httpx.HTTPError as exc:
             raise SourceError(f"lecture de {url} : {exc}") from exc
+        # Un défi anti-bot n'est cherché QUE là où il peut y en avoir un : sur
+        # un statut d'échec, ou sur une page qui ne porte pas `__NEXT_DATA__`
+        # (donc rien à lire). Sur une 200 complète, la chaîne peut venir d'une
+        # annonce légitime — la chercher partout transformait une page valide en
+        # `challenge`, et le statut que `coverage` existe pour porter mentait.
+        #
         # Les redirections ne sont pas suivies : une 3xx arrive ici et échoue.
         # C'est le garde-fou du chemin de référence (une adresse .fr redirigée
         # vers .de serait analysée avec le marché .fr), sans dépendre de la
         # configuration du client injecté.
-        if response.status_code != 200:
-            raise SourceError(f"lecture de {url} : statut {response.status_code}")
-        return response.text
+        if status_code != 200:
+            _raise_if_challenge(text, url, status_code)
+            raise SourceError(f"lecture de {url} : statut {status_code}")
+        if _NEXT_DATA.search(text) is None:
+            # Pas de charge : le corps est peut-être un défi. S'il ne l'est pas,
+            # c'est le parseur qui lèvera `StructureChanged`, en le nommant.
+            _raise_if_challenge(text, url, status_code)
+        return text
 
     async def _wait_turn(self) -> None:
         """Espace deux requêtes d'au moins `pause_s`, sans retarder la première."""

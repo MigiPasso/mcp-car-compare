@@ -13,7 +13,7 @@ contrat est faux, on le corrige explicitement, avec le test qui le prouve.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Protocol
 
 # --- Vocabulaires ------------------------------------------------------------
@@ -21,13 +21,37 @@ from typing import Protocol
 # jamais une devinette : une boîte « semi-automatique » n'est ni auto ni
 # manuelle, et l'inventer fausserait toute comparaison de prix.
 
+# SOURCES est le vocabulaire fermé des sources du plan : ce qu'un appelant a le
+# droit de NOMMER.
 SOURCES = ("autoscout24", "autohero", "lacentrale")
+
+# SERVED_SOURCES est ce que ce lot sait INTERROGER : une source du vocabulaire
+# sans adaptateur est un périmètre, pas une faute de frappe, et les deux refus
+# ne disent pas la même chose à l'appelant. Le périmètre s'écrit ici une fois et
+# nulle part ailleurs : `tools` le lit pour refuser au parsage des critères, et
+# c'est la même liste que la fabrique d'adaptateurs cite.
+SERVED_SOURCES = ("autoscout24",)
+
 MARKETS = ("fr", "de")
 FUELS = ("essence", "diesel", "electrique", "hybride", "")
 GEARS = ("auto", "manuelle", "")
 SELLERS = ("pro", "particulier", "")
 SORTS = ("price_asc", "price_desc", "age_desc")
 SOURCE_STATUSES = ("ok", "challenge", "error", "capped")
+
+# --- Bornes d'entrée ---------------------------------------------------------
+# Refusées au-delà, par une erreur qui nomme la borne. Sans elles, un appelant
+# qui demande `pages_max: 10**9` fait boucler la récolte jusqu'à ce que le site
+# la coupe, et `budget_s: 10**9` l'autorise à durer.
+
+# MAX_PAGES est le plafond réel d'AutoScout24 : mesuré le 2026-11-12, la requête
+# `/lst` s'arrête à 20 pages, soit 400 annonces (PLAN.md §2). Demander plus ne
+# lit rien de plus : c'est un plafond du site, pas un objectif à dépasser.
+MAX_PAGES = 20
+
+# MAX_BUDGET_S borne un appel MCP : au-delà de dix minutes, un client a
+# abandonné la requête depuis longtemps et le corpus travaille pour personne.
+MAX_BUDGET_S = 600
 
 
 @dataclass(slots=True)
@@ -73,18 +97,72 @@ class Listing:
         return asdict(self)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, init=False)
 class Page:
     """Une page de résultats telle que le site la rend.
 
     `announced_total` est le compteur du site pour la requête entière, pas pour
     la page. `None` quand le site ne le donne pas : l'absence est dite, pas
     comblée par `len(listings)`.
+
+    `rendered` est le nombre d'annonces que la page a RENDUES, avant le
+    dédoublonnage intra-page : c'est le chiffre que `coverage.read` compte. Il
+    n'est PAS comparable au compteur du site — il compte des annonces rendues,
+    doublons compris — et la complétude d'une récolte se juge donc sur les
+    annonces distinctes (`unique`), pas sur `read`. Un adaptateur qui
+    dédoublonne doit le renseigner, sinon `read` compterait les annonces déjà
+    dédoublonnées et `read == unique + dropped_duplicates + dropped_invalid`
+    deviendrait faux.
+
+    Le champ est un `int` garanti, pas un `int | None` que `__post_init__`
+    remplirait : `None` n'existe que dans les arguments de construction, et il y
+    veut dire « rien à déclarer » (voir `__init__`). Tout ce qui n'est pas un
+    entier est refusé ici, à la construction : un `rendered` textuel passait en
+    silence, puis se comparait à `<= 0` dans la récolte, donc la panne surgissait
+    loin de sa cause.
     """
 
     listings: list[Listing]
-    announced_total: int | None = None
-    page_number: int = 1
+    announced_total: int | None
+    page_number: int
+    rendered: int
+
+    def __init__(
+        self,
+        listings: list[Listing],
+        announced_total: int | None = None,
+        page_number: int = 1,
+        rendered: int | None = None,
+    ) -> None:
+        """`rendered=None` : la page a rendu ce qu'elle porte, donc une source
+        qui ne dédoublonne pas n'a rien à déclarer, et une doublure de test
+        reste utilisable telle quelle.
+
+        `rendered` non entier (chaîne, flottant, booléen) lève `TypeError` :
+        c'est le seul chiffre auquel `coverage.read` se fie, et un texte se
+        comparait à `<= 0` bien plus loin que l'erreur qui l'a produit.
+
+        `rendered` inférieur à ce que la page porte lève `ValueError` : la
+        récolte en déduit `dropped_duplicates = rendered - len(listings)`, donc
+        un adaptateur qui sous-déclare rendrait ce compteur négatif et casserait
+        en silence l'identité `read == unique + dropped_duplicates +
+        dropped_invalid`, promue au rang de contrat par deux docstrings.
+        """
+        self.listings = listings
+        self.announced_total = announced_total
+        self.page_number = page_number
+        if rendered is None:
+            self.rendered = len(listings)
+        elif isinstance(rendered, bool) or not isinstance(rendered, int):
+            raise TypeError(f"rendered doit être un entier : {rendered!r}")
+        else:
+            if rendered < len(listings):
+                raise ValueError(
+                    f"rendered={rendered} annonce(s) rendues pour "
+                    f"{len(listings)} portée(s) par la page : un adaptateur qui "
+                    f"sous-déclare rendrait dropped_duplicates négatif"
+                )
+            self.rendered = rendered
 
 
 @dataclass(slots=True)
@@ -111,9 +189,21 @@ class Criteria:
 class SourceCoverage:
     """Ce qu'une récolte a réellement lu sur une source. Jamais vide.
 
-    `read` compte les annonces lues, `unique` celles qui restent après
-    dédoublonnage intra-source, `dropped_duplicates` la différence. Un
-    `status` autre que "ok" interdit de présenter la source comme couverte.
+    Comptabilité, dans cet ordre : `read` compte ce que les PAGES ont rendu
+    (avant tout dédoublonnage), `unique` les annonces identifiables qui restent,
+    `dropped_duplicates` celles qui répétaient une annonce déjà vue — y compris
+    dans la même page — et `dropped_invalid` celles qui n'avaient pas
+    d'identifiant, donc ni dédoublonnables ni citables. D'où l'invariant
+    `read == unique + dropped_duplicates + dropped_invalid`.
+
+    `truncated` dit qu'on s'est arrêté sur un plafond — `pages_max`, budget,
+    plafond du site — et non sur une fin de marché. Il ne promet pas que le site
+    annonçait davantage : quand `announced_total` est `None`, le site ne dit pas
+    combien il en annonce, et un plafond atteint laisse alors ignorer s'il
+    restait des annonces. `truncated=True` reste la bonne réponse dans ce cas —
+    on ne peut pas présenter la source comme couverte — et le `reason` l'écrit
+    en toutes lettres : « plafond atteint, total annoncé inconnu ». Un `status`
+    autre que "ok" interdit de présenter la source comme couverte.
     """
 
     source: str
@@ -123,6 +213,7 @@ class SourceCoverage:
     read: int = 0
     unique: int = 0
     dropped_duplicates: int = 0
+    dropped_invalid: int = 0
     truncated: bool = False
     reason: str = ""
 
@@ -137,15 +228,18 @@ class CorpusCoverage:
     Deux récoltes qui se recouvrent, additionnées, annoncent une couverture
     double. On décrit donc des annonces distinctes, et les récoltes restent
     listées à part avec leurs propres chiffres.
+
+    Chaque entrée de `sources` porte le dernier état de sa récolte (`read`,
+    `unique`, `announced_total`, `truncated`, `status`) en plus du nombre
+    d'annonces que la récolte a réellement laissées dans le corpus
+    (`listings`) : un consommateur d'`offers` seul doit pouvoir dire « j'ai lu
+    400 annonces sur 12 479 annoncées », pas seulement « le corpus en contient
+    400 ».
     """
 
     listings_distinct: int = 0
     runs: int = 0
-    sources: list[dict] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.sources is None:
-            self.sources = []
+    sources: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -175,4 +269,14 @@ class StructureChanged(Exception):
 
 
 class SourceError(Exception):
-    """La source n'a pas répondu ce qu'il fallait : statut, défi, réseau."""
+    """La source n'a pas répondu ce qu'il fallait : statut, défi, réseau.
+
+    `status` est le statut de `coverage` que cette erreur mérite : "error" par
+    défaut, "challenge" quand la page est un défi anti-bot. Le porter ici plutôt
+    que de le deviner plus haut est ce qui rend `status="challenge"`
+    atteignable : un vocabulaire que rien ne peut produire est un mensonge.
+    """
+
+    def __init__(self, message: str, *, status: str = "error") -> None:
+        super().__init__(message)
+        self.status = status
