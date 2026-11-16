@@ -185,12 +185,17 @@ class ListingFilter:
     deux (PLAN.md §5 : l'analyse ne dépend pas de l'ordre des appels).
 
     `make` et `model` sont des LIBELLÉS, comparés sans tenir compte de la casse
-    (ASCII) : `model` vaut pour `group_label` ou pour le `group` normalisé.
-    C'est l'inverse de `harvest`, dont les mêmes clés portent les identifiants
-    numériques du site. Deux vocabulaires pour un nom de clé : `tools` le dit
-    dans la description de l'outil, et la réponse nomme les filtres qui ne
-    retiennent aucune annonce (`unmatched_filters`) plutôt que de rendre un zéro
-    muet.
+    (sans casse ni accents) : `model` vaut pour `group_label` ou pour le `group`
+    normalisé.
+    Les deux outils de lecture (`harvest` par ses critères, `analyze_models` par
+    ce même filtre) prennent désormais les **mêmes libellés** : ceux que le site
+    affiche. Il n'y a plus deux vocabulaires pour un nom de clé — c'était le cas
+    tant que `harvest` attendait les identifiants numériques du site, et c'est ce
+    décalage qui a produit « 8 320 BMW annoncées, 7 Série 3 lues ».
+    La comparaison ignore la casse **et les accents** (`unaccent`, mesuré :
+    `CITROËN` trouve `Citroën`) ; `model` vaut pour `group_label` ou pour le
+    `group` normalisé. La réponse nomme les filtres qui ne retiennent aucune
+    annonce (`unmatched_filters`) plutôt que de rendre un zéro muet.
     """
 
     make: str = ""
@@ -262,7 +267,8 @@ class UnmatchedFilter:
     """Un critère appliqué qui ne retient aucune annonce du corpus, et ce que
     le corpus porte réellement pour le même champ.
 
-    Sans lui, `make="13"` (un identifiant de site envoyé là où l'analyse attend
+    Sans lui, un filtre qui ne ramène rien se lirait comme « aucun modèle
+    n'existe » au lieu de « ton libellé ne correspond à rien ».
     un libellé) rendrait zéro groupe sans que rien ne distingue « ce filtre ne
     correspond à rien » de « le corpus est vide ». `present` porte les valeurs
     trouvées, pas une valeur suggérée : l'outil ne devine aucun vocabulaire.
@@ -753,8 +759,8 @@ class Store:
 
         Le sondage ne devine rien : il ne teste ni forme numérique ni casse
         spéciale. `model="500"` est un libellé parfaitement légitime (une Fiat
-        500), et une heuristique « si c'est numérique c'est un identifiant de
-        site » casserait ce cas réel pour rendre service à un autre.
+        500) : une heuristique du genre « une valeur courte et chiffrée est donc
+        un code » casserait ce cas réel pour rendre service à un autre.
         """
         misses: list[UnmatchedFilter] = []
         for part in _filter_parts(listing_filter):

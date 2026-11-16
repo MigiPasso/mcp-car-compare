@@ -138,8 +138,8 @@ class FakeSource:
         self.brand_calls += 1
         if self.error is not None:
             raise self.error
-        # La forme réelle de l'adaptateur (D6) : un identifiant numérique et son
-        # libellé, sans `models` — la taxonomie ne les porte pas.
+        # La forme réelle de l'adaptateur (D6) : une marque et son libellé, sans
+        # `models` — la taxonomie ne les porte que sur une page filtrée sur elle.
         return [{"value": "13", "label": "BMW"}]
 
 
@@ -349,7 +349,7 @@ def test_a_404_label_is_an_error_status_naming_the_slug(tmp_path, monkeypatch):
     tools.register(mcp, db_path=tmp_path / "corpus.db")  # fabrique réelle
     row = harvest(mcp, {"make": "BMW", "model": "Série 3", "pages_max": 1})["coverage"][0]
     assert row["status"] == "error"
-    assert "gamme inconnue du site (404) pour « serie-3 »" in row["reason"]
+    assert "« Série 3 »" in row["reason"] and "(404)" in row["reason"]
     assert (row["read"], row["unique"]) == (0, 0)
 
 

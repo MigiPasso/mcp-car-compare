@@ -247,14 +247,22 @@ def _not_found_message(criteria: Criteria) -> str:
     vide. Le slug est cité parce que c'est lui que le site a refusé, et le
     renvoi vers `offers` parce que c'est là que le libellé exact se lit.
     """
+    # Le 404 porte sur le CHEMIN entier : impossible de savoir de l'extérieur si
+    # c'est la marque ou la gamme que le site n'a pas reconnue. Nommer la seule
+    # gamme enverrait chercher au mauvais endroit quand c'est la marque qui est
+    # fausse — les deux libellés sont donc cités avec le chemin refusé.
+    labels = [criteria.make]
+    if criteria.model:
+        labels.append(criteria.model)
     if criteria.model:
         return (
-            f"gamme inconnue du site (404) pour « {slug(criteria.model)} » — "
-            "vérifie le libellé rendu par offers"
+            f"libellé inconnu du site (404) : « {criteria.make} » / "
+            f"« {criteria.model} » (chemin /lst/{slug(criteria.make)}/"
+            f"{slug(criteria.model)}) — vérifie le libellé rendu par offers"
         )
     return (
-        f"marque inconnue du site (404) pour « {slug(criteria.make)} » — "
-        "vérifie le libellé rendu par offers"
+        f"marque inconnue du site (404) pour « {criteria.make} » "
+        f"(chemin /lst/{slug(criteria.make)}) — vérifie le libellé rendu par offers"
     )
 
 

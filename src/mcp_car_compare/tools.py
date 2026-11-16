@@ -303,7 +303,7 @@ def register(
 
         **`criteria.make` et `criteria.model` sont des LIBELLÉS ici**, comme
         partout dans ce serveur : `model` vaut pour `group_label` comme pour le
-        `group` normalisé, sans tenir compte de la casse (ASCII). L'analyse peut
+        `group` normalisé, sans tenir compte de la casse ni des accents. L'analyse peut
         donc reprendre tels quels les critères d'une récolte. Un filtre qui ne
         retient aucune annonce est NOMMÉ (dans `warnings`) avec les valeurs que
         le corpus porte pour le même champ, plutôt que de rendre un zéro muet

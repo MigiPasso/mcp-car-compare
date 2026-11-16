@@ -499,12 +499,12 @@ def test_modele_sans_marque_refuse_sans_aucune_requete():
     [
         (
             Criteria(make="BMW", model="Gamme Inexistante", markets=("fr",)),
-            "gamme inconnue du site (404) pour « gamme-inexistante »",
+            "libellé inconnu du site (404) : « BMW » / « Gamme Inexistante » (chemin /lst/bmw/gamme-inexistante)",
             "/lst/bmw/gamme-inexistante",
         ),
         (
             Criteria(make="Bmw Inconnu", markets=("fr",)),
-            "marque inconnue du site (404) pour « bmw-inconnu »",
+            "marque inconnue du site (404) pour « Bmw Inconnu » (chemin /lst/bmw-inconnu)",
             "/lst/bmw-inconnu",
         ),
     ],

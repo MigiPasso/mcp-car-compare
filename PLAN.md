@@ -144,7 +144,7 @@ Quatre outils, par fonction. Chaque réponse porte un bloc `coverage`.
 //      (/lst/bmw/serie-3, §8) ; un `model` exige `make`, un 404 est un refus nommé.
 // 3. offers(job_id, cursor?, limit=25) -> {items:[Listing], next_cursor|null,
 //      has_more, coverage}
-// 4. analyze_models(criteria|job_id) -> {groups:[{key,label,n,price_median,
+// 4. analyze_models(criteria) -> {groups:[{key,label,n,price_median,
 //      price_p25, price_p75,year_median,km_median,sources:{…}}], coverage,
 //      warnings}
 ```

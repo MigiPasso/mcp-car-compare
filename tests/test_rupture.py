@@ -247,6 +247,6 @@ def test_une_gamme_inconnue_du_site_est_un_refus_nomme_pas_zero_annonce():
                 Criteria(make="BMW", model="Gamme Inexistante", markets=("fr",)), 1
             )
 
-    with pytest.raises(SourceError, match="gamme inconnue du site \\(404\\) pour « gamme-inexistante »"):
+    with pytest.raises(SourceError, match="libellé inconnu du site \\(404\\) : « BMW » / « Gamme Inexistante »"):
         run(scenario())
     assert recorder.requests[0].url.path == "/lst/bmw/gamme-inexistante"
