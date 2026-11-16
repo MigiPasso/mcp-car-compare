@@ -72,6 +72,17 @@ def price_is_plausible(price: int | None) -> bool:
     """
     return price is not None and price >= PRICE_FLOOR_EUR
 
+
+# Nombre de prix crédibles sous lequel une analyse de modèle s'abstient : sous
+# ce seuil, une médiane décrit trois annonces et se lit comme un prix de
+# marché. Repris d'ICH, et écrit ici UNE fois — `tools` le lit, il ne le
+# recopie pas. Un groupe qui n'atteint pas le seuil apparaît quand même, avec
+# des quantiles nuls et un avertissement qui cite son compte : cacher le groupe
+# ferait disparaître des annonces du corpus, et une estimation inventée serait
+# pire que les deux.
+MIN_COMPARABLES = 6
+
+
 # --- Bornes d'entrée ---------------------------------------------------------
 # Refusées au-delà, par une erreur qui nomme la borne. Sans elles, un appelant
 # qui demande `pages_max: 10**9` fait boucler la récolte jusqu'à ce que le site
@@ -268,6 +279,15 @@ class CorpusCoverage:
     (`listings`) : un consommateur d'`offers` seul doit pouvoir dire « j'ai lu
     400 annonces sur 12 479 annoncées », pas seulement « le corpus en contient
     400 ».
+
+    **Ces compteurs sont ceux d'UNE récolte**, et une entrée de plus les
+    accompagne de son `job_id` : `store.corpus(job_id)` décrit une récolte (huit
+    clés, la paire `(source, market)` n'y a qu'une ligne), `store.whole_corpus()`
+    décrit le corpus entier (neuf clés), où plusieurs récoltes peuvent partager
+    une paire — et là, un compteur sans l'identifiant de sa récolte ne serait pas
+    vérifiable par l'appelant, il serait seulement croyable. `runs` et
+    `listings_distinct` décrivent toujours le corpus, jamais la somme des
+    récoltes.
     """
 
     listings_distinct: int = 0

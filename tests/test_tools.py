@@ -1,4 +1,4 @@
-"""Les trois outils MCP : bornés, bavards sur ce qu'ils n'ont pas lu, hors réseau.
+"""Les quatre outils MCP : bornés, bavards sur ce qu'ils n'ont pas lu, hors réseau.
 
 Aucun test n'ouvre de connexion : la source est factice et injectée, et
 l'horloge est pilotée à la main — aucune assertion ne dépend d'une durée réelle
@@ -168,9 +168,9 @@ def brands(mcp: FakeMcp, source: str = "autoscout24", market: str = "fr") -> dic
 # --- déclaration ---------------------------------------------------------------
 
 
-def test_register_declares_exactly_the_three_tools_of_this_lot(tmp_path):
+def test_register_declares_exactly_the_four_tools_of_this_lot(tmp_path):
     mcp = install(tmp_path, FakeSource([Page(listings=[])]))
-    assert sorted(mcp.tools) == ["harvest", "list_brands", "offers"]
+    assert sorted(mcp.tools) == ["analyze_models", "harvest", "list_brands", "offers"]
 
 
 def test_importing_the_tools_loads_no_source_adapter():

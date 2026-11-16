@@ -1,4 +1,5 @@
-"""Les trois outils MCP du périmètre v1 : marques, récolte bornée, annonces.
+"""Les quatre outils MCP du périmètre v1 : marques, récolte bornée, annonces,
+analyse par modèle.
 
 Chaque outil fait une chose et dit ce qu'elle coûte :
 
@@ -7,18 +8,22 @@ Chaque outil fait une chose et dit ce qu'elle coûte :
 - `harvest` est borné **par source** et ne dépasse jamais son budget ; une
   source coupée est dite `capped`, jamais présentée comme couverte ;
 - `offers` lit la base seule (aucun réseau) et décrit le **corpus** (annonces
-  distinctes), jamais la somme des récoltes.
+  distinctes), jamais la somme des récoltes ;
+- `analyze_models` lit la base seule, agrège par modèle et **s'abstient** sous
+  six prix crédibles au lieu d'estimer un prix qu'aucune annonce ne soutient.
 
 Ce module est le seul propriétaire du client HTTP : un `httpx.AsyncClient` par
 récolte, partagé par toutes ses sources et fermé quoi qu'il arrive. Un client
 par source ferait N pools pour un seul job, et fuirait dès qu'une source lève.
-Rien n'est créé pour `offers`, qui ne parle qu'à SQLite.
+Rien n'est créé pour `offers` ni pour `analyze_models`, qui ne parlent qu'à
+SQLite.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import time
 import uuid
@@ -36,6 +41,8 @@ from .models import (
     MARKETS,
     MAX_BUDGET_S,
     MAX_PAGES,
+    MIN_COMPARABLES,
+    PRICE_FLOOR_EUR,
     SERVED_SOURCES,
     DEFAULT_SORT,
     price_is_plausible,
@@ -49,7 +56,7 @@ from .models import (
     SourceError,
     StructureChanged,
 )
-from .store import Store
+from .store import ListingFilter, Store
 
 # Un site de petites annonces répond en ~0,5 s ; trente secondes est déjà une
 # panne. Le budget de `harvest` borne de toute façon l'attente page par page :
@@ -83,6 +90,15 @@ _CRITERIA_KEYS = frozenset(
 )
 _INT_KEYS = ("year_min", "year_max", "km_max", "price_min", "price_max")
 
+# `sort` et `pages_max` gouvernent une RÉCOLTE : ils n'ont aucun effet sur une
+# analyse du corpus déjà écrit. Les accepter en silence serait exactement ce que
+# le refus des critères inconnus interdit — un critère qu'on croit avoir
+# appliqué. La liste est dérivée du contrat plutôt que recopiée : un critère
+# ajouté demain à `Criteria` est refusé ici tant que personne n'a décidé qu'il
+# filtre une analyse.
+_HARVEST_ONLY_KEYS = ("pages_max", "sort")
+_ANALYSIS_KEYS = _CRITERIA_KEYS.difference(_HARVEST_ONLY_KEYS)
+
 
 class UnsupportedSource(LookupError):
     """La source demandée n'a pas d'adaptateur dans ce lot."""
@@ -95,7 +111,7 @@ def register(
     source_factory: SourceFactory | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Déclare les trois outils sur `mcp`.
+    """Déclare les quatre outils sur `mcp`.
 
     `db_path`, `source_factory` et `clock` existent pour les tests : la source
     est injectée (aucun test ne touche le réseau) et l'horloge aussi (aucune
@@ -246,9 +262,137 @@ def register(
                     for item in items
                 ],
                 "next_cursor": following,
+                # `has_more` est dérivable (`following is not None`) et un
+                # conseiller a proposé de le couper comme doublon. Il reste :
+                # les deux valeurs sont calculées sur la même ligne, donc elles
+                # ne peuvent pas diverger, et `has_more` est ce qu'un appelant
+                # lit juste — un test de nullité est exactement ce qu'un modèle
+                # rate. Ce n'est pas la classe de défaut des surfaces tenues à
+                # la main en deux endroits.
                 "has_more": has_more,
                 "coverage": corpus.as_dict(),
             }
+
+    @mcp.tool()
+    def analyze_models(criteria: dict, limit: int = 30) -> dict:
+        """Agrégats par modèle sur le corpus déjà récolté (30 groupes par défaut,
+        100 au plus) : `{criteria, groups, groups_total, coverage,
+        warnings}`.
+
+        **Le groupe est `(make, group)`**, pas le libellé : `group` est la clé de
+        gamme que l'adaptateur normalise entre marchés (« Série 3 » et « 3er » se
+        rejoignent sur `serie 3`), donc deux libellés de la même gamme font un
+        groupe. Aucune cohorte implicite par année ou par kilométrage : c'est à
+        `criteria` de la définir, et le `criteria` renvoyé dit exactement ce qui
+        a été filtré.
+
+        **`criteria.make` et `criteria.model` sont des LIBELLÉS ici**, pas les
+        identifiants numériques du site : `model` vaut pour `group_label` comme
+        pour le `group` normalisé, sans tenir compte de la casse (ASCII). C'est
+        l'inverse de `harvest`, où les mêmes clés portent les identifiants
+        qu'attend le site (« 13 » pour BMW) : même nom de clé, deux
+        vocabulaires. Un filtre qui ne retient aucune annonce est donc NOMMÉ
+        (dans `warnings`) avec les valeurs que le corpus porte pour le même
+        champ, plutôt que de rendre un zéro muet qu'on lirait comme « ce modèle
+        n'existe pas ». `sort` et `pages_max` sont refusés : ils gouvernent une
+        récolte, pas une analyse.
+
+        **Seuls les prix crédibles portent les quantiles** (`models.PRICE_FLOOR_EUR`) :
+        une annonce à 1 € dit « prix non communiqué » chez AutoScout24, elle
+        reste une annonce. `n` compte toutes les annonces du groupe, `n_priced`
+        celles qui portent un prix crédible, et l'écart est visible.
+
+        **Sous six prix crédibles, l'outil s'abstient**
+        (`models.MIN_COMPARABLES`) : le groupe apparaît quand même, avec
+        `price_median`, `price_p25` et `price_p75` à `null`, et un `warning` qui
+        cite son nombre de comparables. Jamais d'estimation, jamais un groupe
+        caché.
+
+        **Quantiles par interpolation linéaire** sur la série triée, au rang
+        `(n - 1) * q` : pour huit prix triés, `p25` est au rang 1,75 —
+        `x[1] + 0,75 * (x[2] - x[1])` — et la médiane est la moyenne des 4e et 5e.
+        C'est la définition unique de « médiane » dans ce serveur, et elle vaut
+        aussi pour `year_median` et `km_median` (moyenne des deux valeurs du
+        milieu quand l'effectif est pair).
+
+        **Aucun classement.** Les groupes sortent par `n` décroissant, puis
+        `make` et `group` alphabétiques : un ordre neutre, pas un score. Aucun
+        « deal », aucune marge, aucun frais — l'outil rend des distributions, et
+        le choix reste à l'appelant (PLAN.md §10).
+
+        **Périmètre : tout le corpus correspondant aux critères**, pas une
+        récolte : sinon l'analyse d'un marché dépendrait de l'ordre des appels.
+        `coverage` décrit le corpus ENTIER, non filtré (annonces distinctes,
+        récoltes, et par `(source, market)` l'état de sa dernière récolte
+        écrite) ; `criteria` dit à part ce qui a filtré. `groups_total` compte
+        tous les groupes correspondants, pas seulement ceux que `limit` rend :
+        c'est la différence entre « 30 groupes » et « 30 sur 87 ».
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
+            raise ValueError(f"limit doit être un entier de 1 à {MAX_LIMIT}")
+        listing_filter = _parse_analysis_criteria(criteria)
+        with Store(_read_only_corpus_path(db_path)) as store:
+            groups, groups_total = store.model_groups(
+                listing_filter, price_floor=PRICE_FLOOR_EUR, limit=limit
+            )
+            series = store.group_prices(
+                listing_filter,
+                [(group.make, group.group) for group in groups],
+                price_floor=PRICE_FLOOR_EUR,
+            )
+            unmatched = store.unmatched_filters(listing_filter)
+            coverage = store.whole_corpus()
+        rendered: list[dict] = []
+        warnings: list[str] = []
+        for miss in unmatched:
+            present = (
+                ", ".join(miss.present) if miss.present else "aucune valeur pour ce champ"
+            )
+            warnings.append(
+                f"{miss.key}={miss.value!r} : aucune annonce ne correspond ; "
+                f"valeurs présentes dans le corpus : {present}"
+            )
+        for group in groups:
+            prices = series[(group.make, group.group)]
+            median = quartile_low = quartile_high = None
+            if group.n_priced < MIN_COMPARABLES:
+                warnings.append(
+                    f"{group.group_label} : {group.n_priced} prix crédible(s) "
+                    f"(< {MIN_COMPARABLES}) — aucune médiane"
+                )
+            else:
+                median = _quantile(prices, 0.5)
+                quartile_low = _quantile(prices, 0.25)
+                quartile_high = _quantile(prices, 0.75)
+            rendered.append(
+                {
+                    "make": group.make,
+                    "group": group.group,
+                    "group_label": group.group_label,
+                    "n": group.n,
+                    "n_priced": group.n_priced,
+                    "price_median": median,
+                    "price_p25": quartile_low,
+                    "price_p75": quartile_high,
+                    "year_median": group.year_median,
+                    "km_median": group.km_median,
+                }
+            )
+        if not groups_total and not unmatched:
+            # Aucun filtre fautif n'explique le vide : c'est le corpus, ou une
+            # combinaison sans intersection. Un zéro sans phrase se lirait comme
+            # « aucun modèle n'existe ».
+            warnings.append(
+                "aucun groupe ne correspond à ces critères : le corpus est vide, "
+                "ou les critères ne se recoupent pas"
+            )
+        return {
+            "criteria": listing_filter.as_dict(),
+            "groups": rendered,
+            "groups_total": groups_total,
+            "coverage": coverage.as_dict(),
+            "warnings": warnings,
+        }
 
 
 # --- réseau -------------------------------------------------------------------
@@ -660,6 +804,61 @@ def _parse_criteria(raw: dict, *, pages_max: int) -> Criteria:
     )
 
 
+def _parse_analysis_criteria(raw: dict) -> ListingFilter:
+    """Traduit les critères d'une analyse en filtre de corpus.
+
+    Trois différences avec `_parse_criteria`, et chacune refuse de deviner :
+
+    - `sort` et `pages_max` sont refusés : ils n'ont aucun effet sur un corpus
+      déjà écrit, et un critère accepté puis inappliqué est un filtre que
+      l'appelant croit avoir posé ;
+    - `markets` et `sources` n'ont pas de défaut — absents, ils ne filtrent
+      rien. Le défaut de `harvest` (`fr`, `autoscout24`) existe parce qu'une
+      récolte ne peut interroger qu'une marketplace à la fois ; une analyse qui
+      en hériterait cacherait en silence les annonces `.de` du même corpus
+      (PLAN.md §5 : l'analyse ne dépend pas de l'ordre des appels) ;
+    - une source est validée contre le VOCABULAIRE (`models.SOURCES`), pas
+      contre celles que ce lot sait interroger : une analyse ne récolte rien,
+      donc une source déjà présente dans le corpus est analysable même si ce
+      lot ne sait pas (ou plus) l'interroger. Un corpus qui n'en porte aucune
+      rend zéro groupe, et un `warning` nomme le filtre fautif.
+
+    `make` et `model` ne sont pas validés davantage ici qu'à la récolte : ils
+    sont des libellés comparés au corpus, et un libellé inconnu n'est pas une
+    faute de frappe à refuser mais un filtre à nommer dans la réponse.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("criteria doit être un objet")
+    unknown = sorted(set(raw) - _ANALYSIS_KEYS)
+    if unknown:
+        harvest_only = [key for key in unknown if key in _HARVEST_ONLY_KEYS]
+        if harvest_only:
+            raise ValueError(
+                f"critère(s) de récolte, sans effet sur une analyse : "
+                f"{', '.join(harvest_only)} (analyze_models ne récolte rien)"
+            )
+        raise ValueError(f"critère(s) inconnu(s) : {', '.join(unknown)}")
+    fuel = raw.get("fuel", "")
+    if fuel not in FUELS:
+        raise ValueError(f"carburant inconnu : {fuel!r} (attendu : {', '.join(FUELS)})")
+    gear = raw.get("gear", "")
+    if gear not in GEARS:
+        raise ValueError(f"boîte inconnue : {gear!r} (attendu : {', '.join(GEARS)})")
+    # `None` — et non une valeur par défaut — parce qu'un marché absent ne
+    # filtre rien : c'est la différence avec `_parse_criteria`.
+    markets = None if "markets" not in raw else _vocabulary(raw["markets"], MARKETS, "marché")
+    sources = None if "sources" not in raw else _vocabulary(raw["sources"], SOURCES, "source")
+    return ListingFilter(
+        make=_text(raw, "make"),
+        model=_text(raw, "model"),
+        fuel=fuel,
+        gear=gear,
+        markets=markets,
+        sources=sources,
+        **{key: _optional_int(raw, key) for key in _INT_KEYS},
+    )
+
+
 def _parse_budget(budget_s: int | None, *, default: int) -> int:
     """Le budget de l'appelant s'il y en a un, celui de la configuration sinon."""
     if budget_s is None:
@@ -700,3 +899,31 @@ def _optional_int(raw: dict, key: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{key} doit être un entier ou nul : {value!r}")
     return value
+
+
+# --- quantiles d'une analyse ---------------------------------------------------
+
+
+def _quantile(sorted_values: list[int], q: float) -> int | float | None:
+    """Quantile d'une série TRIÉE, par interpolation linéaire au rang (n-1)*q.
+
+    C'est la définition UNIQUE de « médiane » et de « quartile » dans ce serveur.
+    Sans elle, un quartile veut dire deux choses selon qui le calcule : la valeur
+    du rang bas, la moyenne des deux rangs voisins, ou un arrondi. Ici, sur huit
+    prix triés (n = 8) :
+
+    - `p25` est au rang 7 * 0,25 = 1,75, donc `x[1] + 0,75 * (x[2] - x[1])` ;
+    - la médiane est au rang 7 * 0,5 = 3,5, donc la moyenne de `x[3]` et `x[4]` ;
+    - `p75` est au rang 7 * 0,75 = 5,25, donc `x[5] + 0,25 * (x[6] - x[5])`.
+
+    La valeur est rendue telle quelle, entière quand elle tombe juste : arrondir
+    inventerait une précision que la série n'a pas, et une médiane d'année sur un
+    effectif pair vaut légitimement 2020,5.
+    """
+    if not sorted_values:
+        return None
+    position = (len(sorted_values) - 1) * q
+    low = math.floor(position)
+    high = math.ceil(position)
+    value = sorted_values[low] + (sorted_values[high] - sorted_values[low]) * (position - low)
+    return int(value) if float(value).is_integer() else value

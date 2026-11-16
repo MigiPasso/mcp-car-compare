@@ -6,8 +6,8 @@
 Ce script est le client : il démarre `python -m mcp_car_compare` en
 sous-processus et vérifie quatre choses qu'aucun test unitaire ne peut voir :
 
-1. `initialize` répond, puis `tools/list` annonce au moins trois outils, dont
-   les trois de la v1 (`list_brands`, `harvest`, `offers`).
+1. `initialize` répond, puis `tools/list` annonce les quatre outils de la v1
+   (`list_brands`, `harvest`, `offers`, `analyze_models`).
 2. `tools/call offers` avec un `job_id` qui n'existe pas rend une réponse
    structurée — une erreur lisible en JSON-RPC, ou une couverture à zéro — et
    ne fait pas tomber le serveur. Un `ping` juste après le prouve : le
@@ -54,7 +54,7 @@ from pathlib import Path
 
 PROTOCOL_VERSION = "2025-06-18"
 TIMEOUT_S = 60.0
-EXPECTED_TOOLS = ("list_brands", "harvest", "offers")
+EXPECTED_TOOLS = ("list_brands", "harvest", "offers", "analyze_models")
 MAX_MESSAGES = 200
 # Les deux extrêmes de verbosité du serveur : `INFO` journalise une ligne au
 # démarrage, `WARNING` n'en journalise aucune. Le protocole doit sortir intact
@@ -445,8 +445,11 @@ def _protocol_round(log_level: str, *, with_list_brands: bool) -> list[str]:
         if not isinstance(tools, list):
             raise SmokeFailure(f"tools/list sans liste `tools` : {listed!r}"[:400])
         names = [tool.get("name") for tool in tools if isinstance(tool, dict)]
-        if len(tools) < 3:
-            raise SmokeFailure(f"tools/list annonce {len(tools)} outil(s), 3 attendus : {names}")
+        if len(tools) < len(EXPECTED_TOOLS):
+            raise SmokeFailure(
+                f"tools/list annonce {len(tools)} outil(s), "
+                f"{len(EXPECTED_TOOLS)} attendus : {names}"
+            )
         missing = [name for name in EXPECTED_TOOLS if name not in names]
         if missing:
             raise SmokeFailure(f"outils de la v1 absents de tools/list : {missing} (reçus : {names})")
