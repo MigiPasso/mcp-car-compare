@@ -1,0 +1,22 @@
+[project]
+name = "mcp-car-compare"
+version = "0.1.0"
+description = "Serveur MCP stdio : récolte d'annonces automobiles, corpus SQLite local, comparaison par l'IA"
+# 3.12 est le plancher réel : le code utilise `slots=True` sur les dataclasses
+# et les annotations modernes (models.py), et l'image est python:3.12-slim.
+requires-python = ">=3.12"
+
+# Pas de `dependencies` ici : requirements.txt est la seule source de vérité,
+# et l'image fait `pip install -r requirements.txt`. Rien ne construit de wheel
+# ni ne fait `pip install .`, donc deux listes de dépendances ne pourraient que
+# diverger — celle de pyproject finirait obsolète sans que rien ne le dise.
+
+[tool.pytest.ini_options]
+# `src` dans le chemin d'import : le paquet n'est pas installé, et lancer
+# `pytest` depuis la racine doit marcher sans `pip install -e .` ni PYTHONPATH
+# à poser à la main. C'est le même chemin que PYTHONPATH=/app/src dans l'image.
+pythonpath = ["src"]
+testpaths = ["tests"]
+# `tests/smoke_stdio.py` n'est pas collecté (pytest ne ramasse que `test_*.py`)
+# et c'est voulu : c'est une preuve autonome, lancée par `python`, parce qu'elle
+# a besoin de piloter le serveur en sous-processus et de lire ses octets bruts.

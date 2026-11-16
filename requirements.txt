@@ -1,0 +1,16 @@
+# `mcp` est épinglé < 2 volontairement, et ce n'est pas une bourde.
+#
+# mcp 2.x renomme `FastMCP` en `MCPServer` (`mcp.server.mcpserver`) et
+# `from mcp.server.fastmcp import FastMCP` y lève ModuleNotFoundError. Tout ce
+# dépôt — PLAN.md §1, `server.py`, et les tests qui construisent le serveur —
+# est écrit contre l'API 1.x. Sans plafond, un `pip install` refait donne mcp
+# 2.3.0 et le serveur ne démarre plus.
+#
+# Ne pas retirer ce plafond sans porter le code sur l'API 2.x : la migration
+# n'apporte rien à un serveur stdio qui expose trois outils, alors que le
+# plafond garantit que `docker build` redonne le même comportement dans un an.
+mcp[cli]>=1.30,<2
+
+# Client HTTP des adaptateurs de source. Aucun test ne touche le réseau : ils
+# injectent un transport httpx factice (voir `Source` dans models.py).
+httpx>=0.27

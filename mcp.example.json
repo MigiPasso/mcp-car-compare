@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "mcp-car-compare": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "--interactive",
+        "--name",
+        "mcp-car-compare",
+        "--volume",
+        "mcp-car-compare-data:/data",
+        "mcp-car-compare:latest"
+      ]
+    }
+  }
+}

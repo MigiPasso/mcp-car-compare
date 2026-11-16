@@ -1,0 +1,5 @@
+# Outils de développement : pytest pour les tests unitaires des autres zones
+# (parseurs, corpus) ; la preuve du protocole E0 n'en a pas besoin, elle est
+# autonome (`python tests/smoke_stdio.py`).
+-r requirements.txt
+pytest>=8

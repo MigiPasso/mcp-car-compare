@@ -1,0 +1,182 @@
+"""Tests de rupture AutoScout24 : la casse doit être VUE, pas absorbée.
+
+Le défaut que ces tests interdisent est « 0 annonce, aucune erreur » : une page
+de défi anti-robot, une erreur du site ou une structure changée se liraient
+comme un marché désert, et la couverture annoncerait zéro annonce sur un marché
+qui en compte des milliers.
+
+Un HTML sans `__NEXT_DATA__` est une casse (`StructureChanged`) ; un statut
+non-200 est un refus (`SourceError`) ; une page qui n'est manifestement pas une
+page de résultats (fiche, réponse d'API) est un refus aussi. Aucun de ces cas ne
+rend une liste vide.
+
+Aucun test ne touche le réseau : le transport `httpx` est factice.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import pathlib
+
+import httpx
+import pytest
+
+from mcp_car_compare.models import Criteria, SourceError, StructureChanged
+from mcp_car_compare.sources.autoscout24 import Autoscout24
+
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "autoscout24"
+
+
+def fixture(name: str) -> str:
+    """Corps d'une page capturée."""
+    return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def run(awaitable):
+    return asyncio.run(awaitable)
+
+
+class Recorder:
+    """Transport factice : rend un corps et un statut fixes."""
+
+    def __init__(self, body: str, status: int = 200) -> None:
+        self.body = body
+        self.status = status
+        self.requests: list[httpx.Request] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(self.status, text=self.body)
+
+
+def search(body: str, status: int = 200, market: str = "fr"):
+    """Joue une recherche sur la page donnée et rend la `Page` obtenue."""
+    recorder = Recorder(body, status)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(recorder.handler)
+        ) as client:
+            source = Autoscout24(client, market)
+            return await source.search(Criteria(markets=(market,)), 1)
+
+    return run(scenario())
+
+
+def test_html_sans_next_data_leve_structure_changed():
+    # Une page de blocage n'a pas la charge attendue. La lire comme « aucune
+    # annonce » annoncerait un marché vide : c'est le défaut que ce test
+    # interdit.
+    with pytest.raises(StructureChanged, match="__NEXT_DATA__"):
+        search("<html><body>Unauthorized</body></html>")
+
+
+def test_page_de_defi_ne_rend_rien_de_silencieux():
+    # Page de défi anti-robot : HTTP 200, HTML complet, aucun __NEXT_DATA__.
+    # C'est exactement ce qu'un site durci rend, et le statut ne le dit pas.
+    defi = (
+        "<!DOCTYPE html><html><head><title>Vérification en cours</title>"
+        "<script>window.__challenge = 'datadome';</script></head>"
+        "<body><p>Merci de patienter, vérification de votre navigateur…</p>"
+        "</body></html>"
+    )
+    with pytest.raises(StructureChanged):
+        search(defi)
+
+
+def test_next_data_illisible_leve_structure_changed():
+    casse = (
+        '<html><head><script id="__NEXT_DATA__" type="application/json">'
+        '{"props": {"pageProps": {"listings": [ , ]}}}</script></head></html>'
+    )
+    with pytest.raises(StructureChanged, match="illisible"):
+        search(casse)
+
+
+def test_pageprops_absent_leve_source_error():
+    # `__NEXT_DATA__` présent mais sans `props.pageProps` : réponse d'API ou
+    # page d'erreur du site, pas une recherche.
+    page = (
+        '<html><head><script id="__NEXT_DATA__" type="application/json">'
+        '{"props": {}}</script></head></html>'
+    )
+    with pytest.raises(SourceError):
+        search(page)
+
+
+def test_fiche_lue_comme_une_recherche_leve_source_error():
+    # `detail_de.html` est une fiche réellement capturée : elle porte un
+    # `__NEXT_DATA__` et un `pageProps`, mais aucune liste d'annonces. La lire
+    # comme une page de résultats rendrait 0 annonce sans erreur.
+    with pytest.raises(SourceError, match="sans liste d'annonces"):
+        search(fixture("detail_de.html"), market="de")
+
+
+def test_statut_403_leve_source_error():
+    with pytest.raises(SourceError, match="403"):
+        search("<html><body>Forbidden</body></html>", status=403)
+
+
+def test_statut_500_leve_source_error():
+    with pytest.raises(SourceError, match="500"):
+        search("<html><body>Erreur du site</body></html>", status=500)
+
+
+def test_redirection_jamais_suivie():
+    # Une .fr redirigée vers .de serait analysée avec le marché .fr et ses
+    # annonces porteraient le mauvais marché : la 3xx échoue au lieu d'être
+    # suivie, quel que soit le client injecté.
+    with pytest.raises(SourceError, match="302"):
+        search("", status=302)
+
+
+def test_erreur_reseau_leve_source_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connexion refusée", request=request)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await Autoscout24(client, "fr").search(Criteria(markets=("fr",)), 1)
+
+    with pytest.raises(SourceError, match="connexion refusée"):
+        run(scenario())
+
+
+def test_listings_pas_une_liste_leve_structure_changed():
+    page = (
+        '<html><head><script id="__NEXT_DATA__" type="application/json">'
+        '{"props": {"pageProps": {"numberOfResults": 10, "listings": "oops"}}}'
+        "</script></head></html>"
+    )
+    with pytest.raises(StructureChanged, match="listings"):
+        search(page)
+
+
+def test_recherche_vide_annoncee_par_le_site_n_est_pas_une_casse():
+    # Frontière : le site DIT que la recherche est vide (0 annoncé, liste
+    # vide). Ce n'est pas une casse — c'est une réponse. Une page muette sur
+    # les deux points serait, elle, refusée (voir le test de la fiche).
+    page = (
+        '<html><head><script id="__NEXT_DATA__" type="application/json">'
+        '{"props": {"pageProps": {"numberOfResults": 0, "listings": []}}}'
+        "</script></head></html>"
+    )
+    resultat = search(page)
+    assert resultat.listings == []
+    assert resultat.announced_total == 0
+
+
+def test_marque_sans_identifiant_numerique_refusee_avant_toute_requete():
+    recorder = Recorder(fixture("search_fr.html"))
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(recorder.handler)
+        ) as client:
+            await Autoscout24(client, "fr").search(Criteria(make="Renault"), 1)
+
+    # Un slug envoyé à la place d'un identifiant ne filtre rien : la requête
+    # rendrait la marque entière en se présentant comme une recherche de modèle.
+    with pytest.raises(SourceError):
+        run(scenario())
+    assert recorder.requests == []
