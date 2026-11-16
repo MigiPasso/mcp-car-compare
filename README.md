@@ -109,7 +109,7 @@ La configuration est la même partout — `mcpServers`, un `command` et ses `arg
   "mcpServers": {
     "mcp-car-compare": {
       "command": "docker",
-      "args": ["run", "--rm", "--interactive", "--name", "mcp-car-compare",
+      "args": ["run", "--rm", "--interactive",
                "--volume", "mcp-car-compare-data:/data", "mcp-car-compare:latest"]
     }
   }
@@ -117,9 +117,12 @@ La configuration est la même partout — `mcpServers`, un `command` et ses `arg
 ```
 
 **pi** — `~/.pi/agent/mcp.json` : fusionner le bloc `mcpServers` ci-dessus.
-(`--name` évite d'accumuler des conteneurs si un client meurt sans fermer
-proprement ; deux clients simultanés ne peuvent donc pas partager la même base —
-c'est voulu, un fichier SQLite n'aime pas deux écrivains.)
+Pas de `--name` fixe, volontairement : un nom fixe empêche un second client de
+démarrer et bloque tout si une session se termine mal — mesuré, `docker: Conflict.
+The container name is already in use`. Deux clients partagent donc le volume, ce
+que la base supporte (`WAL` + `busy_timeout`, et huit récoltes concurrentes
+testées sans erreur). Pour nettoyer les conteneurs orphelins d'une session tuée :
+`docker ps --filter ancestor=mcp-car-compare:latest -q | xargs -r docker rm -f`.
 
 **Claude Desktop** — fusionner le même bloc dans :
 

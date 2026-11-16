@@ -684,7 +684,10 @@ async def _harvest_one(
             f"distincte(s) ({read} lue(s))"
         )
         truncated = True
-        reason = f"{reason} ; {stopped}" if reason else stopped
+        # `reason` porte déjà le plafond quand l'un a coupé : le répéter sous une
+        # autre forme donnait « plafond atteint … ; la source s'est arrêtée avant
+        # la fin … », deux fois le même fait dans un champ que l'appelant cite.
+        reason = reason or stopped
     coverage = SourceCoverage(
         source=source_name,
         market=market,
