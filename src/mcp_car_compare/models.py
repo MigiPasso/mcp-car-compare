@@ -273,21 +273,21 @@ class CorpusCoverage:
     double. On décrit donc des annonces distinctes, et les récoltes restent
     listées à part avec leurs propres chiffres.
 
-    Chaque entrée de `sources` porte le dernier état de sa récolte (`read`,
-    `unique`, `announced_total`, `truncated`, `status`) en plus du nombre
-    d'annonces que la récolte a réellement laissées dans le corpus
-    (`listings`) : un consommateur d'`offers` seul doit pouvoir dire « j'ai lu
-    400 annonces sur 12 479 annoncées », pas seulement « le corpus en contient
+    Chaque entrée de `sources` porte huit clés, les mêmes dans les deux
+    chemins : `listings_in_corpus` compte les annonces de la paire
+    `(source, market)` dans le corpus entier, `read` et `unique` celles de la
+    récolte, `announced_total` ce que le site annonçait, avec `status` et
+    `truncated` — un consommateur d'`offers` seul doit pouvoir dire « j'ai lu 400
+    annonces sur 12 479 annoncées », pas seulement « le corpus en contient
     400 ».
 
-    **Ces compteurs sont ceux d'UNE récolte**, et une entrée de plus les
-    accompagne de son `job_id` : `store.corpus(job_id)` décrit une récolte (huit
-    clés, la paire `(source, market)` n'y a qu'une ligne), `store.whole_corpus()`
-    décrit le corpus entier (neuf clés), où plusieurs récoltes peuvent partager
-    une paire — et là, un compteur sans l'identifiant de sa récolte ne serait pas
-    vérifiable par l'appelant, il serait seulement croyable. `runs` et
-    `listings_distinct` décrivent toujours le corpus, jamais la somme des
-    récoltes.
+    Une seule chose par clé : `store.corpus(job_id)` et `store.whole_corpus()`
+    mesurent la même paire de la même façon, et aucune entrée ne porte de
+    `job_id` — l'appelant qui a lancé une récolte l'a déjà, et deux formes pour
+    un même type seraient un contrat à deux vitesses. `runs` et
+    `listings_distinct` décrivent l'objet de la couverture — la récolte pour
+    `store.corpus(job_id)` (c'est elle qu'`offers` pagine), le corpus entier
+    pour `store.whole_corpus()` — jamais la somme des `read`.
     """
 
     listings_distinct: int = 0

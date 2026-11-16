@@ -504,6 +504,12 @@ class Store:
         Un corpus de 400 annonces sur un marché qui en annonce 12 479 doit
         pouvoir le dire à un appelant qui ne lit qu'`offers`.
 
+        `listings_in_corpus` compte les annonces de la PAIRE `(source, market)`
+        dans le corpus entier, exactement comme `whole_corpus()` : deux chemins,
+        une seule chose par clé. Ce que la récolte a laissé de neuf est déjà
+        porté par `unique` ; compter ici les seules lignes de `run_listings`
+        aurait donné deux chiffres différents sous le même nom selon l'outil.
+
         Une ligne de `runs` par `(source, market)`, sans agrégat ni `GROUP BY` :
         c'est la clé primaire de `runs`, `(job_id, source, market)`, qui
         garantit qu'une paire n'y a qu'une ligne (`write_run` remplace, il
@@ -525,9 +531,9 @@ class Store:
             'r."status" AS status, r."announced_total" AS announced_total, '
             'r."read" AS read, r."unique" AS "unique", '
             'r."truncated" AS truncated, '
-            '(SELECT COUNT(*) FROM "run_listings" AS rl '
-            'WHERE rl."job_id" = r."job_id" AND rl."source" = r."source" '
-            'AND rl."market" = r."market") AS listings '
+            '(SELECT COUNT(*) FROM "listings" AS l '
+            'WHERE l."source" = r."source" AND l."market" = r."market") '
+            'AS listings_in_corpus '
             'FROM "runs" AS r WHERE r."job_id" = ? '
             'ORDER BY r."source", r."market"',
             (job_id,),
@@ -539,7 +545,7 @@ class Store:
                 {
                     "source": row["source"],
                     "market": row["market"],
-                    "listings": row["listings"],
+                    "listings_in_corpus": row["listings_in_corpus"],
                     "status": row["status"],
                     "announced_total": row["announced_total"],
                     "read": row["read"],
@@ -571,9 +577,10 @@ class Store:
         de SQLite : un `ON CONFLICT DO UPDATE` la retirerait sans rien casser
         d'autre, et « la dernière récolte » deviendrait « une récolte
         arbitraire » — d'où ce commentaire. L'entrée ne porte pas le `job_id` de
-        la récolte : deux formes de couverture pour un même type (8 clés ici, 9
-        là) seraient un contrat à deux vitesses, et l'appelant qui veut le détail
-        d'une récolte l'a déjà, c'est lui qui l'a lancée.
+        la récolte : les huit clés sont les mêmes que celles de `corpus()`, et
+        deux formes de couverture pour un même type seraient un contrat à deux
+        vitesses ; l'appelant qui veut le détail d'une récolte l'a déjà, c'est
+        lui qui l'a lancée.
 
         Les annonces se comptent dans `listings` : la clé primaire
         `(source, market, source_id)` y garantit une ligne par annonce, donc
@@ -587,7 +594,8 @@ class Store:
             'r."read" AS read, r."unique" AS "unique", '
             'r."truncated" AS truncated, '
             '(SELECT COUNT(*) FROM "listings" AS l '
-            'WHERE l."source" = r."source" AND l."market" = r."market") AS listings '
+            'WHERE l."source" = r."source" AND l."market" = r."market") '
+            'AS listings_in_corpus '
             'FROM "runs" AS r WHERE r.rowid = ('
             'SELECT MAX(r2.rowid) FROM "runs" AS r2 '
             'WHERE r2."source" = r."source" AND r2."market" = r."market") '
@@ -600,7 +608,7 @@ class Store:
                 {
                     "source": row["source"],
                     "market": row["market"],
-                    "listings": row["listings"],
+                    "listings_in_corpus": row["listings_in_corpus"],
                     "status": row["status"],
                     "announced_total": row["announced_total"],
                     "read": row["read"],

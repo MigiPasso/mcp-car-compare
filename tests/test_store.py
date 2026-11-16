@@ -182,7 +182,7 @@ def test_a_run_is_written_once_per_source_and_market(tmp_path):
             {
                 "source": "autoscout24",
                 "market": "fr",
-                "listings": 0,
+                "listings_in_corpus": 0,
                 "status": "ok",
                 "announced_total": None,
                 "read": 40,
@@ -219,7 +219,7 @@ def test_a_corpus_without_listings_reports_zeros_not_an_absent_block(tmp_path):
             {
                 "source": "autoscout24",
                 "market": "fr",
-                "listings": 0,
+                "listings_in_corpus": 0,
                 "status": "capped",
                 "announced_total": None,
                 "read": 0,
@@ -261,7 +261,7 @@ def test_a_corpus_entry_says_how_much_of_the_market_was_read(tmp_path):
             sort="price_asc",
         )
         entry = store.corpus("job-1").sources[0]
-        assert entry["listings"] == 2  # ce que le corpus contient
+        assert entry["listings_in_corpus"] == 2  # ce que le corpus contient
         assert (entry["read"], entry["unique"]) == (20, 2)  # ce que la récolte a lu
         assert entry["announced_total"] == 12_479  # ce que le site annonçait
         assert (entry["truncated"], entry["status"]) == (True, "ok")
@@ -292,10 +292,33 @@ def test_each_source_and_market_appears_with_its_own_count(tmp_path):
         corpus = store.corpus("job-1")
         assert corpus.runs == 2
         assert corpus.listings_distinct == 3
-        assert [(row["source"], row["market"], row["listings"], row["read"]) for row in corpus.sources] == [
+        assert [(row["source"], row["market"], row["listings_in_corpus"], row["read"]) for row in corpus.sources] == [
             ("autoscout24", "de", 2, 2),
             ("autoscout24", "fr", 1, 1),
         ]
+
+
+def test_both_coverage_paths_count_the_same_pair_in_the_corpus(tmp_path):
+    # `corpus(job_id)` (lu par `offers`) et `whole_corpus()` (lu par
+    # `analyze_models`) décrivent le corpus sous la MÊME clé : la paire
+    # `(source, market)`, comptée dans tout le corpus. Deux chiffres différents
+    # sous le même nom feraient lire deux couvertures pour un seul corpus —
+    # mesuré : 2 d'un côté, 3 de l'autre, pour la même paire.
+    with open_store(tmp_path) as store:
+        store.add_page("job-1", [listing("1"), listing("2")])
+        store.write_run("job-1", run(read=2, unique=2), criteria_hash="h", sort="price_asc")
+        store.add_page("job-2", [listing("1"), listing("3")])
+        store.write_run("job-2", run(read=2, unique=2), criteria_hash="h", sort="price_asc")
+
+        from_job = store.corpus("job-2").sources[0]
+        from_whole = store.whole_corpus().sources[0]
+
+    # Mêmes huit clés, mêmes valeurs : aucune des deux lectures n'a de
+    # vocabulaire à elle.
+    assert from_job == from_whole
+    # La paire entière dans le corpus, et à part ce que la récolte a laissé.
+    assert from_job["listings_in_corpus"] == 3
+    assert from_job["unique"] == 2
 
 
 # --- concurrence ----------------------------------------------------------------

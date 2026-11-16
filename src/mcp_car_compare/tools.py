@@ -153,8 +153,9 @@ def register(
         en erreur ferait lire « cette source a échoué ». Ici il n'y a pas de
         `coverage`, et le message dit exactement ce qui manque.
 
-        `market` n'est pas décoratif : les identifiants de marque rendus par
-        `autoscout24.fr` ne filtrent rien sur `.de`, et l'inverse.
+        `market` n'est pas décoratif : les libellés de marque sont rendus dans la
+        langue du marché, et c'est le libellé — pas l'identifiant `value` — que
+        `harvest` attend dans `criteria.make`.
         """
         if source not in SOURCES:
             raise ValueError(f"source inconnue : {source!r} (attendu : {', '.join(SOURCES)})")
@@ -168,7 +169,21 @@ def register(
         """Récolte bornée : `budget_s` secondes **par source**, jamais dépassé
         (sans valeur : celui de la configuration, 60 s). Rend `{job_id,
         coverage, cursor}` ; `cursor` est le curseur d'entrée de `offers`. Une
-        source coupée porte `status="capped"` et `read=0` si rien n'a été lu."""
+        source coupée porte `status="capped"` et `read=0` si rien n'a été lu.
+
+        **`criteria.make` et `criteria.model` sont des LIBELLÉS**, ceux que le
+        site affiche et qu'`offers` écrit dans `make` et `group_label` :
+        `model` accepte donc `"Série 3"` comme `"serie 3"` (le `group`
+        normalisé). Le site filtre la marque et la gamme par le chemin de
+        l'adresse (`/lst/bmw/serie-3`), et chaque segment se dérive du libellé :
+        il n'y a **aucun identifiant à deviner**, et `list_brands` ne rend plus
+        de vocabulaire à part.
+
+        Deux refus à connaître avant d'appeler : un `model` sans `make` est
+        refusé (l'adresse n'existerait pas), et un libellé que le site ne
+        connaît pas rend `status="error"` avec un 404 nommant le segment
+        demandé — jamais zéro annonce, qui se lirait comme un marché vide.
+        """
         config = load_config()
         crit = _parse_criteria(criteria, pages_max=config.pages_max)
         budget = _parse_budget(budget_s, default=config.budget_s)
@@ -286,16 +301,14 @@ def register(
         `criteria` de la définir, et le `criteria` renvoyé dit exactement ce qui
         a été filtré.
 
-        **`criteria.make` et `criteria.model` sont des LIBELLÉS ici**, pas les
-        identifiants numériques du site : `model` vaut pour `group_label` comme
-        pour le `group` normalisé, sans tenir compte de la casse (ASCII). C'est
-        l'inverse de `harvest`, où les mêmes clés portent les identifiants
-        qu'attend le site (« 13 » pour BMW) : même nom de clé, deux
-        vocabulaires. Un filtre qui ne retient aucune annonce est donc NOMMÉ
-        (dans `warnings`) avec les valeurs que le corpus porte pour le même
-        champ, plutôt que de rendre un zéro muet qu'on lirait comme « ce modèle
-        n'existe pas ». `sort` et `pages_max` sont refusés : ils gouvernent une
-        récolte, pas une analyse.
+        **`criteria.make` et `criteria.model` sont des LIBELLÉS ici**, comme
+        partout dans ce serveur : `model` vaut pour `group_label` comme pour le
+        `group` normalisé, sans tenir compte de la casse (ASCII). L'analyse peut
+        donc reprendre tels quels les critères d'une récolte. Un filtre qui ne
+        retient aucune annonce est NOMMÉ (dans `warnings`) avec les valeurs que
+        le corpus porte pour le même champ, plutôt que de rendre un zéro muet
+        qu'on lirait comme « ce modèle n'existe pas ». `sort` et `pages_max`
+        sont refusés : ils gouvernent une récolte, pas une analyse.
 
         **Seuls les prix crédibles portent les quantiles** (`models.PRICE_FLOOR_EUR`) :
         une annonce à 1 € dit « prix non communiqué » chez AutoScout24, elle
@@ -444,8 +457,8 @@ async def _brands(source: str, market: str, make_source: SourceFactory) -> dict:
 
     `brands` vide sans `error` voudrait dire « ce site ne vend aucune marque » :
     les deux cas ne doivent pas se ressembler. `market` est rendu parce que les
-    identifiants qu'on vient de lire n'ont de sens que sur cette marketplace :
-    les mêmes marques lues sur `.de` ne filtrent rien sur `.fr`.
+    libellés qu'on vient de lire sont ceux de cette marketplace : `harvest` les
+    attend tels quels, et c'est d'eux que se dérive le segment d'adresse.
     """
     try:
         adapter = make_source(source)

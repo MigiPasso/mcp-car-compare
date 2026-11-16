@@ -28,6 +28,7 @@ import asyncio
 import json
 import re
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -192,23 +193,85 @@ def image_url(raw: object) -> str:
     return ""
 
 
+def slug(label: str) -> str:
+    """Le segment d'adresse par lequel AutoScout24 filtre une marque ou une gamme.
+
+    Le site ne filtre la gamme ni par un identifiant ni par un paramètre : il la
+    filtre par le CHEMIN de l'adresse, et ce segment se dérive mécaniquement du
+    libellé affiché. Mesuré le 2026-11-28, chaque cas vérifié en 200 avec son
+    compte d'annonces : « Citroën » -> `citroen` (5 466), « DS Automobiles » ->
+    `ds-automobiles` (910), « Mercedes-Benz » -> `mercedes-benz` (7 448),
+    « Alfa Romeo » -> `alfa-romeo` (575), et « Mercedes-Benz » + « Classe C » ->
+    `/lst/mercedes-benz/classe-c` (867). `/lst/renault/clio` rend 2 501, et un
+    segment inventé (`/lst/bmw/gamme-inexistante`) rend 404 : c'est cette dérive
+    qui rend un libellé fautif bruyant au lieu de le lire comme « aucune
+    annonce ».
+
+    La règle : minuscules, accents retirés (NFKD, marques combinantes
+    supprimées), `&` rendu « et », tout le reste — apostrophes comprises — rendu
+    un tiret, tirets multiples écrasés, bords nettoyés.
+    """
+    bare = unicodedata.normalize("NFKD", label.lower())
+    bare = "".join(char for char in bare if not unicodedata.combining(char))
+    parts = re.split(r"[^a-z0-9]+", bare.replace("&", " et "))
+    return "-".join(part for part in parts if part)
+
+
+def _search_path(criteria: Criteria) -> str:
+    """Le chemin d'une page filtrée : `/lst`, puis un segment par libellé.
+
+    Un `model` sans `make` n'a pas d'adresse : le site ne connaît pas de gamme
+    hors d'une marque, et le libellé seul serait lu comme un segment de marque.
+    Il est donc refusé ici, avant la requête.
+    """
+    if criteria.model and not criteria.make:
+        raise SourceError("choisis une marque avant le modèle")
+    segments: list[str] = []
+    for label in (criteria.make, criteria.model):
+        if not label:
+            continue
+        segment = slug(label)
+        if not segment:
+            raise SourceError(
+                f"libellé {label!r} : aucun caractère utilisable dans une adresse"
+            )
+        segments.append(segment)
+    return "/lst" + "".join(f"/{segment}" for segment in segments)
+
+
+def _not_found_message(criteria: Criteria) -> str:
+    """Le message d'un 404 : le site a refusé le chemin, donc le libellé est faux.
+
+    Un 404 n'est pas « aucune annonce » : la gamme demandée n'existe pas dans le
+    vocabulaire du site, et rendre zéro annonce ferait conclure à un marché
+    vide. Le slug est cité parce que c'est lui que le site a refusé, et le
+    renvoi vers `offers` parce que c'est là que le libellé exact se lit.
+    """
+    if criteria.model:
+        return (
+            f"gamme inconnue du site (404) pour « {slug(criteria.model)} » — "
+            "vérifie le libellé rendu par offers"
+        )
+    return (
+        f"marque inconnue du site (404) pour « {slug(criteria.make)} » — "
+        "vérifie le libellé rendu par offers"
+    )
+
+
 def search_url(criteria: Criteria, page_number: int, market: str) -> str:
     """Assemble l'adresse d'une page de résultats pour un marché.
 
     Le marché est passé séparément plutôt que lu dans `criteria.markets` : une
     adresse vise un seul domaine, et `search()` refuse d'en recevoir plusieurs
     (voir `_market_of`).
+
+    `make` et `model` sont des LIBELLÉS, ceux que le site affiche et qu'`offers`
+    écrit dans `make` et `group_label` : le site filtre la marque et la gamme par
+    le chemin de l'adresse (`/lst/bmw/serie-3`), et chaque segment se dérive du
+    libellé par `slug`.
     """
     base = market_base(market)
-    # Le site attend des identifiants NUMÉRIQUES dans mmmv (13 pour BMW, 9|1624
-    # pour l'Audi A3). Un slug ou un libellé envoyé à leur place ne filtre rien
-    # et rendrait la marque entière en se présentant comme une recherche de
-    # modèle : il est refusé ici, jamais envoyé.
-    make = _site_id(criteria.make, "marque")
-    model = _site_id(criteria.model, "modèle")
-    if model and not make:
-        # « mmmv=|1624|| » est malformé : le site ne saurait pas le lire.
-        raise SourceError("choisis une marque avant le modèle")
+    path = _search_path(criteria)
 
     params = {
         "atype": "C",  # voitures seulement
@@ -218,9 +281,6 @@ def search_url(criteria: Criteria, page_number: int, market: str) -> str:
         # Une page part de 1 chez le site : une valeur plus petite demanderait
         # une page inexistante et lirait un résultat vide.
         "page": str(max(page_number, 1)),
-        # mmmv = marque|modèle|gamme|variante. Le modèle n'occupe que la
-        # deuxième case ; sans modèle, les trois dernières restent vides.
-        "mmmv": f"{make}|{model}||" if model else f"{make}|||",
     }
     # Une borne à zéro vaut « pas de filtre », donc paramètre absent : envoyer
     # 0 demanderait « prix entre 0 et 0 € ».
@@ -239,16 +299,7 @@ def search_url(criteria: Criteria, page_number: int, market: str) -> str:
     gear_code = GEAR_PARAMS.get(criteria.gear)
     if gear_code:
         params["gear"] = gear_code
-    return f"{base}/lst?{httpx.QueryParams(params)}"
-
-
-def _site_id(value: str, what: str) -> str:
-    """Identifiant numérique du site, ou `SourceError` (règle de `core.IsSiteID`)."""
-    if value and not all("0" <= char <= "9" for char in value):
-        raise SourceError(
-            f"{what} {value!r} : identifiant numérique attendu (par exemple 9 pour Audi)"
-        )
-    return value
+    return f"{base}{path}?{httpx.QueryParams(params)}"
 
 
 def _market_of(criteria: Criteria) -> str:
@@ -537,9 +588,9 @@ class Autoscout24:
     arguments : `brands()`, que le Protocol `Source` appelle sans argument.
     `search()` prend son marché dans `criteria.markets` et refuse d'en recevoir
     plusieurs (une `Page` est celle d'un marché). Le marché de `brands()` compte
-    : les identifiants de marque et de modèle sont propres à chaque marketplace,
-    donc un `list_brands` bâti sur `.fr` rend des identifiants inutilisables
-    contre `.de`.
+    : la marque et la gamme sont filtrées par un segment dérivé du libellé, et
+    ce libellé est rendu dans la langue du marché (« Série 3 » en France,
+    « 3er » en Allemagne) — c'est le libellé que `harvest` attend.
 
     La cadence est tenue par l'instance : `pause_s` entre deux requêtes, jamais
     avant la première. `clock` et `sleep` sont injectables pour que les tests
@@ -578,7 +629,10 @@ class Autoscout24:
         """Lit une page de résultats pour le marché des critères."""
         market = _market_of(criteria)
         url = search_url(criteria, page_number, market)
-        body = await self._get(url, market)
+        # Un 404 reçoit son propre message : le chemin est refusé, donc le
+        # libellé de la marque ou de la gamme est faux, et c'est ce que le
+        # message doit dire au lieu du statut brut.
+        body = await self._get(url, market, not_found=_not_found_message(criteria))
         return parse_search_page(body, market, page_number)
 
     async def brands(self) -> list[dict]:
@@ -587,7 +641,9 @@ class Autoscout24:
         body = await self._get(url, self.market)
         return parse_brands(body)
 
-    async def _get(self, url: str, market: str) -> str:
+    async def _get(self, url: str, market: str, *, not_found: str = "") -> str:
+        """Corps d'une page. `not_found` est le message d'un 404, quand
+        l'appelant sait quel libellé le site a refusé."""
         await self._wait_turn()
         try:
             async with self._client.stream(
@@ -615,6 +671,8 @@ class Autoscout24:
         # configuration du client injecté.
         if status_code != 200:
             _raise_if_challenge(text, url, status_code)
+            if status_code == 404 and not_found:
+                raise SourceError(not_found)
             raise SourceError(f"lecture de {url} : statut {status_code}")
         if _NEXT_DATA.search(text) is None:
             # Pas de charge : le corps est peut-être un défi. S'il ne l'est pas,

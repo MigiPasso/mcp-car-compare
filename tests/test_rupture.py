@@ -232,17 +232,21 @@ def test_recherche_vide_annoncee_par_le_site_n_est_pas_une_casse():
     assert resultat.announced_total == 0
 
 
-def test_marque_sans_identifiant_numerique_refusee_avant_toute_requete():
-    recorder = Recorder(fixture("search_fr.html"))
+def test_une_gamme_inconnue_du_site_est_un_refus_nomme_pas_zero_annonce():
+    # Frontière : le site répond 404 sur un segment qu'il ne connaît pas. C'est
+    # un refus explicite qui nomme le libellé dérivé, jamais « 0 annonce » — un
+    # zéro se lirait comme un marché vide, et le libellé fautif ne serait
+    # jamais corrigé.
+    recorder = Recorder("<html>404</html>", status=404)
 
     async def scenario():
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(recorder.handler)
         ) as client:
-            await Autoscout24(client, "fr").search(Criteria(make="Renault"), 1)
+            await Autoscout24(client, "fr").search(
+                Criteria(make="BMW", model="Gamme Inexistante", markets=("fr",)), 1
+            )
 
-    # Un slug envoyé à la place d'un identifiant ne filtre rien : la requête
-    # rendrait la marque entière en se présentant comme une recherche de modèle.
-    with pytest.raises(SourceError):
+    with pytest.raises(SourceError, match="gamme inconnue du site \\(404\\) pour « gamme-inexistante »"):
         run(scenario())
-    assert recorder.requests == []
+    assert recorder.requests[0].url.path == "/lst/bmw/gamme-inexistante"

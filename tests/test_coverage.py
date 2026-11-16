@@ -69,7 +69,7 @@ def corpus_source(
     source: str,
     market: str,
     *,
-    listings: int,
+    listings_in_corpus: int,
     status: str = "ok",
     announced_total: int | None = None,
     read: int = 0,
@@ -77,7 +77,8 @@ def corpus_source(
     truncated: bool = False,
 ) -> dict:
     """Une entrée de `coverage["sources"]` côté `offers` : les huit clés que
-    `store.py` émet (PLAN.md §5, décision D5).
+    `store.py` émet (PLAN.md §5, décision D5) — les mêmes que dans `harvest`,
+    `listings_in_corpus` comprise.
 
     Les huit sont écrites ici, jamais un sous-ensemble : c'est ce qui fait
     échouer ce test si le bloc change de forme. Une entrée comparée à trois clés
@@ -86,7 +87,7 @@ def corpus_source(
     return {
         "source": source,
         "market": market,
-        "listings": listings,
+        "listings_in_corpus": listings_in_corpus,
         "status": status,
         "announced_total": announced_total,
         "read": read,
@@ -169,7 +170,7 @@ def test_offers_coverage_describes_the_corpus_not_the_sum_of_the_harvests(tmp_pa
     # 4 annonces distinctes dans le corpus, 5 lues par la récolte : les deux
     # chiffres coexistent dans la même entrée, sans jamais s'additionner.
     assert coverage["sources"] == [
-        corpus_source("autoscout24", "fr", listings=4, read=5, unique=4)
+        corpus_source("autoscout24", "fr", listings_in_corpus=4, read=5, unique=4)
     ]
 
 
@@ -192,7 +193,7 @@ def test_two_offers_cover_the_corpus_once_without_duplicates(tmp_path):
     corpus = {
         "listings_distinct": 9,
         "runs": 1,
-        "sources": [corpus_source("autoscout24", "fr", listings=9, read=9, unique=9)],
+        "sources": [corpus_source("autoscout24", "fr", listings_in_corpus=9, read=9, unique=9)],
     }
     assert coverages[0] == coverages[-1] == corpus
 
@@ -205,7 +206,7 @@ def test_an_empty_corpus_reports_zeros_not_a_missing_block(tmp_path):
     assert page["coverage"] == {
         "listings_distinct": 0,
         "runs": 1,
-        "sources": [corpus_source("autoscout24", "fr", listings=0)],
+        "sources": [corpus_source("autoscout24", "fr", listings_in_corpus=0)],
     }
 
 
@@ -224,7 +225,7 @@ def test_a_source_that_never_started_still_appears_with_zero(tmp_path):
     coverage = mcp.tools["offers"](result["job_id"], None, 25)["coverage"]
     assert coverage["listings_distinct"] == 0
     assert coverage["sources"] == [
-        corpus_source("autoscout24", "fr", listings=0, status="error", truncated=True)
+        corpus_source("autoscout24", "fr", listings_in_corpus=0, status="error", truncated=True)
     ]
 
 
@@ -236,6 +237,6 @@ def test_the_corpus_counts_harvests_and_listings_separately(tmp_path):
     assert coverage["runs"] == 2
     assert coverage["listings_distinct"] == 4
     assert coverage["sources"] == [
-        corpus_source("autoscout24", "de", listings=2, read=2, unique=2),
-        corpus_source("autoscout24", "fr", listings=2, read=2, unique=2),
+        corpus_source("autoscout24", "de", listings_in_corpus=2, read=2, unique=2),
+        corpus_source("autoscout24", "fr", listings_in_corpus=2, read=2, unique=2),
     ]

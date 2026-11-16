@@ -363,11 +363,11 @@ def test_chaque_critere_restreint_le_corpus_et_est_annonce(tmp_path, criteria, a
 
 
 def test_un_filtre_qui_ne_correspond_a_rien_est_nomme_avec_les_valeurs_du_corpus(tmp_path):
-    # `harvest` attend l'identifiant numérique de la marque (« 13 » pour BMW) et
-    # `analyze_models` un libellé : même nom de clé, deux vocabulaires. Envoyer
-    # l'identifiant ici ne correspond à rien, et un zéro muet se lirait comme
-    # « ce modèle n'existe pas ». Aucune heuristique ne devine le vocabulaire :
-    # `model="500"` reste un libellé légitime (une Fiat 500).
+    # `make` et `model` sont des libellés, ici comme à la récolte : un
+    # identifiant numérique n'est plus un vocabulaire d'appel, c'est un filtre
+    # qui ne correspond à rien, et il est nommé comme tel plutôt que rendu en
+    # zéro muet. Aucune heuristique ne devine le vocabulaire : `model="500"`
+    # reste un libellé légitime (une Fiat 500).
     seed(tmp_path, [car("r1", make="Renault"), car("b1", make="BMW", group="serie 3", label="Série 3")])
     result = analyze(tmp_path, {"make": "13"})
     assert (result["groups"], result["groups_total"]) == ([], 0)
@@ -412,17 +412,19 @@ def test_la_couverture_decrit_le_corpus_entier_meme_quand_un_filtre_est_applique
     result = analyze(tmp_path, {"markets": ["fr"]})
     assert [group["make"] for group in result["groups"]] == ["Renault"]
     assert result["coverage"]["listings_distinct"] == 2
-    assert [(row["market"], row["listings"]) for row in result["coverage"]["sources"]] == [
+    assert [
+        (row["market"], row["listings_in_corpus"]) for row in result["coverage"]["sources"]
+    ] == [
         ("de", 1),
         ("fr", 1),
     ]
 
 
 def test_la_couverture_par_paire_porte_la_derniere_recolte_ecrite(tmp_path):
-    # Deux récoltes de la même paire : les compteurs sont ceux de la dernière
-    # écrite (jamais la somme : 4 serait une couverture double) et ils portent
-    # leur `job_id`, sans lequel ils ne sont que croyables. Les annonces, elles,
-    # se comptent dans le corpus : la ligne revue n'est pas une seconde annonce.
+    # Deux récoltes de la même paire : les compteurs de récolte sont ceux de la
+    # dernière écrite (jamais la somme : 4 serait une couverture double). Les
+    # annonces, elles, se comptent dans le corpus ENTIER de la paire — les huit
+    # clés, sans `job_id`, sont les mêmes que celles de `offers`.
     seed(tmp_path, [car("r1"), car("r2")], job_id="job-1", runs=(harvest_run(read=2, unique=2),))
     seed(tmp_path, [car("r1"), car("r3")], job_id="job-2", runs=(harvest_run(read=2, unique=2),))
     coverage = analyze(tmp_path)["coverage"]
@@ -432,14 +434,14 @@ def test_la_couverture_par_paire_porte_la_derniere_recolte_ecrite(tmp_path):
     assert set(entry) == {
         "source",
         "market",
-        "listings",
+        "listings_in_corpus",
         "status",
         "announced_total",
         "read",
         "unique",
         "truncated",
     }
-    assert (entry["read"], entry["unique"], entry["listings"]) == (2, 2, 3)
+    assert (entry["read"], entry["unique"], entry["listings_in_corpus"]) == (2, 2, 3)
 
 
 # --- un corpus vide --------------------------------------------------------------

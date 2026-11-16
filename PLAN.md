@@ -139,6 +139,9 @@ Quatre outils, par fonction. Chaque réponse porte un bloc `coverage`.
 // 2. harvest(criteria, budget_s=60, sources?) -> {job_id, coverage, cursor}
 //      criteria = {make, model, year_min, year_max, km_max, price_min,
 //                  price_max, fuel, gear, markets, pages_max, sort}
+//      `make` et `model` sont des LIBELLÉS du site (« BMW », « Série 3 » ou le
+//      `group` « serie 3 ») : la marque et la gamme se filtrent par le CHEMIN
+//      (/lst/bmw/serie-3, §8) ; un `model` exige `make`, un 404 est un refus nommé.
 // 3. offers(job_id, cursor?, limit=25) -> {items:[Listing], next_cursor|null,
 //      has_more, coverage}
 // 4. analyze_models(criteria|job_id) -> {groups:[{key,label,n,price_median,
@@ -157,10 +160,15 @@ Quatre outils, par fonction. Chaque réponse porte un bloc `coverage`.
 // dans offers / analyze_models : le corpus, jamais la somme des récoltes
 // (forme réelle, à la racine — il n'y a pas de clé `corpus`)
 {"listings_distinct":812,"runs":3,
- "sources":[{"source":"autoscout24","market":"fr","listings":612,
+ "sources":[{"source":"autoscout24","market":"fr","listings_in_corpus":612,
              "status":"ok","announced_total":465,"read":60,"unique":60,
              "truncated":true}]}
 ```
+
+Les entrées `sources` d'`offers` et d'`analyze_models` portent les **huit mêmes
+clés**, `listings_in_corpus` comprise : les annonces distinctes de la paire
+`(source, market)` dans tout le corpus, jamais un `job_id`. Ce qu'une récolte a
+laissé est déjà porté par `unique`.
 
 **On n'additionne jamais deux récoltes.** `announced_total` est un instantané du
 site au moment de la requête et `read` un compteur de récolte ; deux récoltes
@@ -297,6 +305,7 @@ Décisions prises pendant le premier lot, après mesure :
 | `list_brands.models` | **retiré** de la charge : jamais rempli en production (301 marques, 0 modèle) |
 | Tri par défaut | **`age_desc`**, pas `price_asc` : mesuré le 16/11, AutoScout24 publie des annonces à **1 €** pour « prix non communiqué » (`priceRaw: 1`), et un tri par prix croissant commence donc par ces annonces-là. La première page d'un corpus sans critère était 100 % de la boue |
 | Prix crédible | plancher **100 €**, repris d'ICH (mesuré : 228 annonces sous 800 €, prix triés `10, 280, 299, 300, …` — un seul aberrant). La valeur stockée reste celle du site ; `offers` ajoute `price_plausible` pour que l'appelant n'ait pas à le deviner |
+| Filtre marque/gamme | **par le CHEMIN de l'adresse**, dérivé du libellé : `/lst/<slug(make)>/<slug(model)>`. Slug = minuscules, accents retirés (NFKD), `&` → `et`, le reste → `-`. Mesuré le 28/11 : `/lst/bmw/serie-3` rend 1 434 annonces toutes « Série 3 », `/lst/renault/clio` 2 501, `/lst/bmw/gamme-inexistante` **404**. `mmmv` (identifiants de MOTORISATION — 316, 320, M3 — et non de gamme) est abandonné : un `model` sans `make` est refusé, et un 404 est un refus nommé, jamais 0 annonce |
 
 ## 9. La décision qui reste ouverte
 

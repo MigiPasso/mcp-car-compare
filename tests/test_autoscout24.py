@@ -35,6 +35,7 @@ from mcp_car_compare.sources.autoscout24 import (
     image_url,
     normalize_group,
     search_url,
+    slug,
 )
 from mcp_car_compare.sources.labels import (
     FUEL_LABELS,
@@ -382,8 +383,8 @@ def test_pause_entre_deux_pages_et_jamais_avant_la_premiere():
 
 def test_url_porte_les_filtres_du_contrat():
     criteria = Criteria(
-        make="9",
-        model="1624",
+        make="Audi",
+        model="A3",
         year_min=2020,
         year_max=2022,
         km_max=75000,
@@ -396,11 +397,15 @@ def test_url_porte_les_filtres_du_contrat():
     )
     url = httpx.URL(search_url(criteria, 2, "de"))
 
-    assert (url.scheme, url.host, url.path) == ("https", "www.autoscout24.de", "/lst")
+    assert (url.scheme, url.host, url.path) == (
+        "https",
+        "www.autoscout24.de",
+        "/lst/audi/a3",
+    )
     params = url.params
     assert params["atype"] == "C"  # voitures seulement
     assert params["page"] == "2"
-    assert params["mmmv"] == "9|1624||"  # marque | modèle | gamme | variante
+    assert "mmmv" not in params  # les identifiants numériques ne filtrent plus rien
     assert (params["sort"], params["desc"]) == ("price", "0")
     assert params["fregfrom"] == "2020"
     assert params["fregto"] == "2022"
@@ -417,7 +422,7 @@ def test_url_sans_filtres_n_ajoute_ni_borne_ni_code():
 
     for absent in ("pricefrom", "priceto", "kmto", "fregfrom", "fregto", "fuel", "gear"):
         assert absent not in params
-    assert params["mmmv"] == "|||"
+    assert url.path == "/lst"  # sans libellé, aucun segment n'est inventé
     assert params["page"] == "1"
 
 
@@ -444,7 +449,37 @@ def test_url_tri_decroissant_et_par_age():
     assert (age["sort"], age["desc"]) == ("age", "1")
 
 
-def test_marque_non_numerique_refusee_sans_aucune_requete():
+@pytest.mark.parametrize(
+    ("label", "segment"),
+    [
+        # Les cinq libellés MESURÉS le 2026-11-28 : chacun rend 200 sur le site,
+        # avec le compte d'annonces en commentaire. C'est cette dérive-là qui
+        # fait qu'un libellé suffit à filtrer une gamme.
+        ("Citroën", "citroen"),  # 5 466
+        ("DS Automobiles", "ds-automobiles"),  # 910
+        ("Mercedes-Benz", "mercedes-benz"),  # 7 448
+        ("Alfa Romeo", "alfa-romeo"),  # 575
+        ("Classe C", "classe-c"),  # 867, sous /mercedes-benz
+        # Le reste éprouve la RÈGLE écrite dans la docstring, que ces cinq
+        # libellés-là ne portent pas : « & », apostrophe, tirets multiples,
+        # bords, casse et accents.
+        ("Audi & Cie", "audi-et-cie"),
+        ("L'Argus", "l-argus"),
+        ("Série 3 Touring", "serie-3-touring"),
+        ("  Classe   C  ", "classe-c"),
+        ("__BMW__", "bmw"),
+    ],
+)
+def test_slug_des_libelles_mesures(label, segment):
+    # Un seul endroit dérive un segment d'adresse : sans ces cas, une règle
+    # fausse (« Citroen » sans tréma, « mercedes_benz ») ne casserait rien ici
+    # et rendrait 404 chez le site, lu comme « gamme inconnue ».
+    assert slug(label) == segment
+
+
+def test_modele_sans_marque_refuse_sans_aucune_requete():
+    # Un `model` sans `make` n'a pas d'adresse : le libellé seul serait lu comme
+    # un segment de marque, donc la requête ne part pas.
     recorder = Recorder(fixture("search_fr.html"))
 
     async def scenario():
@@ -452,16 +487,54 @@ def test_marque_non_numerique_refusee_sans_aucune_requete():
             transport=httpx.MockTransport(recorder.handler)
         ) as client:
             source = Autoscout24(client, "fr")
-            with pytest.raises(SourceError, match="identifiant numérique"):
-                await source.search(Criteria(make="Renault", markets=("fr",)), 1)
+            with pytest.raises(SourceError, match="marque"):
+                await source.search(Criteria(model="Serie 3", markets=("fr",)), 1)
 
     run(scenario())
     assert recorder.requests == []
 
 
-def test_modele_sans_marque_refuse():
-    with pytest.raises(SourceError, match="marque"):
-        search_url(Criteria(model="1624", markets=("fr",)), 1, "fr")
+@pytest.mark.parametrize(
+    ("criteria", "message", "path"),
+    [
+        (
+            Criteria(make="BMW", model="Gamme Inexistante", markets=("fr",)),
+            "gamme inconnue du site (404) pour « gamme-inexistante »",
+            "/lst/bmw/gamme-inexistante",
+        ),
+        (
+            Criteria(make="Bmw Inconnu", markets=("fr",)),
+            "marque inconnue du site (404) pour « bmw-inconnu »",
+            "/lst/bmw-inconnu",
+        ),
+    ],
+)
+def test_un_404_est_un_refus_explicite_qui_nomme_le_libelle(criteria, message, path):
+    # Un 404 n'est pas « aucune annonce » : c'est le site qui refuse le segment
+    # dérivé d'un libellé faux. Rendre zéro annonce ferait conclure à un marché
+    # vide, et l'appelant ne saurait jamais que c'est son libellé qui est faux.
+    recorder = Recorder("<html>404</html>", status=404)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(recorder.handler)
+        ) as client:
+            source = Autoscout24(client, "fr")
+            await source.search(criteria, 1)
+
+    with pytest.raises(SourceError) as caught:
+        run(scenario())
+    assert str(caught.value) == message + " — vérifie le libellé rendu par offers"
+    assert caught.value.status == "error"  # le statut que `coverage` porte
+    assert recorder.requests[0].url.path == path
+
+
+def test_un_libelle_sans_caractere_utilisable_est_refuse():
+    # Un segment vide construirait « /lst/bmw/ », que le site lirait comme une
+    # autre adresse : le refus nomme le libellé au lieu de laisser un 404
+    # obscur.
+    with pytest.raises(SourceError, match="aucun caractère utilisable"):
+        search_url(Criteria(make="BMW", model="'''", markets=("fr",)), 1, "fr")
 
 
 def test_marche_inconnu_refuse():

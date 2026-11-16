@@ -28,7 +28,6 @@ from mcp_car_compare.models import (
     SourceError,
     StructureChanged,
 )
-from mcp_car_compare.sources.autoscout24 import search_url
 from mcp_car_compare.store import Store, UnknownJobError
 
 
@@ -289,37 +288,12 @@ def brands_page() -> str:
     )
 
 
-def test_a_brand_value_from_list_brands_is_usable_as_a_make(tmp_path):
-    # L'identifiant de marque n'a qu'un usage : être renvoyé tel quel dans
-    # `make`. Le chaîner est la seule preuve que le catalogue rend quelque chose
-    # d'utilisable — un slug (« bmw ») traverserait `list_brands` sans problème
-    # et ferait échouer `harvest` en `SourceError`, loin du regard de
-    # l'appelant.
-    source = FakeSource([Page(listings=[listing(1)])])
-    mcp = install(tmp_path, source)
-    value = brands(mcp)["brands"][0]["value"]
-    harvest(mcp, {"make": value, "pages_max": 1})
-    criteria = source.searches[0][0]
-    assert value == "13"
-    assert criteria.make == value
-    # Même entrée, même constructeur d'URL que l'adaptateur réel : des chiffres
-    # passent, un libellé serait refusé.
-    assert httpx.URL(search_url(criteria, 1, "fr")).params["mmmv"] == "13|||"
+def recording_client(monkeypatch, handler) -> type[httpx.AsyncClient]:
+    """Un VRAI client `httpx` (options retenues) sur un transport factice.
 
-
-def test_list_brands_traverses_the_real_factory_for_the_requested_market(tmp_path, monkeypatch):
-    """`list_brands` est le seul outil dont les arguments ne portent pas le
-    marché de la récolte : c'est `_default_source` qui décide du domaine.
-
-    Ce test le traverse pour de vrai (adaptateur réel, transport factice). Sans
-    lui, `market="de"` pourrait lire `.fr` sans que rien ne le dise, et les
-    identifiants rendus ne filtreraient rien sur `.de`.
+    C'est le seul moyen d'éprouver la fabrique réelle des sources — donc le
+    constructeur d'adresse de l'adaptateur — sans toucher au réseau.
     """
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, text=brands_page())
 
     class RecordingClient(httpx.AsyncClient):
         """Vrai client httpx, options retenues, transport factice."""
@@ -332,8 +306,70 @@ def test_list_brands_traverses_the_real_factory_for_the_requested_market(tmp_pat
             RecordingClient.instances.append(self)
 
     monkeypatch.setattr(tools.httpx, "AsyncClient", RecordingClient)
+    return RecordingClient
+
+
+def test_harvest_takes_the_labels_offers_renders(tmp_path, monkeypatch):
+    # Le seul vocabulaire de `harvest` est le libellé : la marque et la gamme se
+    # filtrent par le CHEMIN de l'adresse, dérivé du libellé qu'`offers` écrit
+    # dans `make` et `group_label`. Ce test traverse le constructeur d'adresse
+    # réel (fabrique réelle, transport factice) : sans lui, un identifiant
+    # numérique continuerait de traverser `harvest` sans erreur et ne filtrerait
+    # rien, ce qui est exactement le défaut mesuré (8 320 annonces BMW pour 7
+    # Série 3).
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=brands_page())
+
+    recording_client(monkeypatch, handler)
     mcp = FakeMcp()
     tools.register(mcp, db_path=tmp_path / "corpus.db")  # fabrique réelle
+    # Le libellé de `group_label` et le `group` normalisé désignent la MÊME
+    # gamme : les deux formes mènent au même segment, donc au même filtre.
+    harvest(mcp, {"make": "BMW", "model": "Série 3", "pages_max": 1})
+    harvest(mcp, {"make": "BMW", "model": "serie 3", "pages_max": 1})
+    assert [(request.url.host, request.url.path) for request in requests] == [
+        ("www.autoscout24.fr", "/lst/bmw/serie-3")
+    ] * 2
+    assert requests[0].url.params["atype"] == "C"
+    assert "mmmv" not in requests[0].url.params
+
+
+def test_a_404_label_is_an_error_status_naming_the_slug(tmp_path, monkeypatch):
+    # Une gamme inconnue du site ne doit jamais rendre zéro annonce : un 0 se
+    # lirait comme un marché vide, alors que c'est le libellé qui est faux. Le
+    # statut est `error`, et le message nomme le segment que le site a refusé.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="<html>404</html>")
+
+    recording_client(monkeypatch, handler)
+    mcp = FakeMcp()
+    tools.register(mcp, db_path=tmp_path / "corpus.db")  # fabrique réelle
+    row = harvest(mcp, {"make": "BMW", "model": "Série 3", "pages_max": 1})["coverage"][0]
+    assert row["status"] == "error"
+    assert "gamme inconnue du site (404) pour « serie-3 »" in row["reason"]
+    assert (row["read"], row["unique"]) == (0, 0)
+
+
+def test_list_brands_traverses_the_real_factory_for_the_requested_market(tmp_path, monkeypatch):
+    """`list_brands` est le seul outil dont les arguments ne portent pas le
+    marché de la récolte : c'est `_default_source` qui décide du domaine.
+
+    Ce test le traverse pour de vrai (adaptateur réel, transport factice). Sans
+    lui, `market="de"` pourrait lire `.fr` sans que rien ne le dise, et les
+    libellés rendus seraient ceux de l'autre marché.
+    """
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=brands_page())
+
+    RecordingClient = recording_client(monkeypatch, handler)
+    mcp = FakeMcp()
+    tools.register(mcp, db_path=tmp_path / "corpus.db")
     result = brands(mcp, "autoscout24", market="de")
     assert result["error"] == ""
     assert result["market"] == "de"
