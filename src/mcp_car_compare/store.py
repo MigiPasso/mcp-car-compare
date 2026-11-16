@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .models import CorpusCoverage, Listing, SourceCoverage
+from .models import CorpusCoverage, Listing, SourceCoverage, price_is_plausible
 
 # BUSY_TIMEOUT_MS est le temps qu'une écriture attend un verrou tenu par une
 # autre connexion avant de rendre `database is locked`. Sans lui, un `offers`
@@ -120,6 +120,25 @@ CREATE TABLE IF NOT EXISTS "run_listings" (
     "market"    TEXT NOT NULL,
     "source_id" TEXT NOT NULL,
     PRIMARY KEY ("job_id", "source", "market", "source_id")
+);
+
+-- Index de la COHORTE de `Store.market_gaps` : `offers` cherche, pour chaque
+-- annonce rendue, les comparables d'une gamme et d'une année. Sans lui, chaque
+-- annonce coûtait un balayage complet de `listings` — mesuré sur 40 000
+-- annonces, page de 100 : ≈2 450 ms, contre 2 ms avec cet index.
+--
+-- PIÈGE, et il ne fait aucun bruit : l'index porte sur une EXPRESSION qui
+-- appelle une fonction PYTHON (`unaccent`). Le jour où `_unaccent` change
+-- (`ß`, `ø`, une marque combinante de plus), les entrées déjà écrites
+-- correspondent à l'ANCIENNE fonction, et SQLite ne peut pas le savoir : les
+-- lignes concernées cessent simplement de se joindre, sans erreur. Qui touche
+-- à `_unaccent` doit donc reconstruire l'index (`REINDEX` ou `DROP INDEX` puis
+-- réouverture de la base).
+--
+-- `IF NOT EXISTS` le rend idempotent : `executescript` le rejoue à chaque
+-- ouverture, donc une base écrite par la version d'avant le reçoit aussi.
+CREATE INDEX IF NOT EXISTS "idx_listings_cohort" ON "listings"(
+    unaccent("make"), unaccent("group"), "year"
 );
 """
 
@@ -369,6 +388,54 @@ def _filter_clause(parts: Sequence[_FilterPart]) -> tuple[str, tuple[object, ...
     return " AND ".join(part.sql for part in parts), tuple(
         value for part in parts for value in part.params
     )
+
+
+# --- écart au marché d'une annonce --------------------------------------------
+# `offers` chiffre chaque annonce face aux annonces comparables du corpus. Deux
+# natures de chiffres, encore : la référence (`market_median`, `market_n`)
+# décrit le marché, l'écart (`gap_eur`, `gap_pct`) décrit CETTE annonce.
+
+# Les prix de la cohorte d'une annonce, dans l'ordre où `_comparable_prices`
+# passe ses paramètres : `make`, `group`, année basse, année haute, puis
+# l'identité de l'annonce exclue. Constante nommée pour que le test de plan
+# d'exécution interroge le VRAI texte de la requête, pas une copie qui
+# dériverait.
+# La cohorte est restreinte à `(source, market)` de l'annonce : ce sont deux
+# dimensions de son identité, et les oublier rendait le chiffre faux. Mesuré le
+# 2026-11-28 : une Golf .fr à 20 000 € s'affichait « +37,9 % » au-dessus du
+# marché parce que quatre Golf .de à 30 000 € étaient dans sa médiane — et une
+# annonce .de était chiffrée contre des prix français, +106,9 %. Deux marchés ne
+# portent ni la même TVA ni les mêmes frais : leurs prix ne se comparent pas. Le
+# `source` est là pour la même raison, un site n'étant pas l'autre (AutoScout24
+# et LaCentrale n'affichent pas les mêmes prix pour la même voiture).
+_COHORT_SQL = (
+    'SELECT l."price" AS price FROM "listings" AS l '
+    'WHERE unaccent(l."make") = unaccent(?) '
+    'AND unaccent(l."group") = unaccent(?) '
+    'AND l."year" BETWEEN ? AND ? '
+    'AND l."source" = ? '
+    'AND l."market" = ? '
+    'AND NOT (l."source" = ? AND l."market" = ? AND l."source_id" = ?) '
+    'ORDER BY l."price"'
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketGap:
+    """Les comparables d'une annonce, et leur médiane de prix.
+
+    `n` compte les comparables réellement entrés dans la médiane — prix
+    crédibles, année à ±1 an, annonce exclue. `median` ne vaut `None` que
+    quand `n` vaut 0 : les deux champs disent la même chose sous deux formes,
+    donc aucun des deux ne peut mentir seul.
+
+    Le seuil d'abstention (`models.MIN_COMPARABLES`) n'est PAS appliqué ici :
+    décider qu'il manque des comparables est une règle de surface, et `tools`
+    la porte une seule fois, pour `offers` comme pour `analyze_models`.
+    """
+
+    median: int | None
+    n: int
 
 
 class Store:
@@ -802,6 +869,93 @@ class Store:
             )
         return misses
 
+    # --- écart au marché ----------------------------------------------------
+
+    def market_gaps(
+        self, listings: Sequence[Listing]
+    ) -> dict[tuple[str, str, str], MarketGap]:
+        """La référence de marché de chaque annonce : médiane des comparables
+        et effectif, sous la clé d'identité de l'annonce.
+
+        Cohorte d'une annonce : mêmes `(make, group)` NORMALISÉS (`unaccent`,
+        comme `model_groups`, donc « CLIO » et « Clio » font une seule gamme),
+        année à ±1 an, prix crédibles seulement, et **l'annonce elle-même
+        exclue** : sans cette exclusion elle tirerait sa propre référence vers
+        elle, donc vers un écart nul. Une annonce sans année n'a pas de
+        cohorte — la fenêtre ±1 n'existe pas — et rend `n = 0`, jamais une
+        cohorte élargie.
+
+        Le plancher de crédibilité n'est PAS écrit dans le SQL :
+        `models.price_is_plausible` est la seule règle qui décide ce qu'est un
+        prix, et elle filtre la série une fois lue. Un `price >= 100` recopié
+        ici se désynchroniserait du `price_plausible` que `offers` rend à côté,
+        sans que rien ne le dise.
+
+        Une requête par annonce, et c'est mesuré : sur un corpus de 40 000
+        annonces avec l'index `idx_listings_cohort`, cent références coûtent
+        2 ms ; sans cet index, ≈2 450 ms. Pré-calculer par lot d'années ne
+        payerait pas cette complexité.
+
+        La clé du dictionnaire est l'identité de l'annonce
+        (`Listing.key()`), pas son rang dans la page : une référence ne peut
+        donc pas glisser d'une annonce à l'autre.
+        """
+        gaps: dict[tuple[str, str, str], MarketGap] = {}
+        for listing in listings:
+            prices = self._comparable_prices(listing)
+            gaps[listing.key()] = MarketGap(median=_median_of(prices), n=len(prices))
+        return gaps
+
+    def _comparable_prices(self, listing: Listing) -> list[int]:
+        """Les prix de la cohorte d'une annonce, triés croissant.
+
+        Appelée une fois par annonce par `market_gaps`, qui documente la
+        cohorte. L'année est dans le `WHERE` : un comparable sans année ne peut
+        pas être « de la même année à ±1 an », et `NULL BETWEEN ? AND ?` n'est
+        jamais vrai — l'absence s'exclut d'elle-même au lieu de passer pour
+        n'importe quelle année.
+
+        Le SQL est une constante nommée parce qu'un test le soumet à
+        `EXPLAIN QUERY PLAN` : c'est ce qui prouve que l'index de cohorte est
+        utilisé, sans dépendre d'un chronomètre.
+        """
+        if listing.year is None:
+            return []
+        rows = self._conn.execute(
+            _COHORT_SQL,
+            (
+                listing.make,
+                listing.group,
+                listing.year - 1,
+                listing.year + 1,
+                listing.source,
+                listing.market,
+                listing.source,
+                listing.market,
+                listing.source_id,
+            ),
+        ).fetchall()
+        return [row["price"] for row in rows if price_is_plausible(row["price"])]
+
+
+def _median_of(sorted_prices: Sequence[int]) -> int | None:
+    """Médiane d'une série TRIÉE de prix entiers, en euros entiers.
+
+    Effectif impair : la valeur du milieu. Effectif pair : la moyenne des deux
+    valeurs du milieu, arrondie à l'euro supérieur quand elle tombe sur un
+    demi-euro — `market_median` est un montant entier, comme `price`
+    (PLAN.md §8 : euros entiers, jamais recalculés). C'est la médiane de
+    `tools._quantile` à q = 0,5, arrondie à l'unité d'affichage.
+
+    `None` sur une série vide : aucune médiane ne décrit zéro annonce.
+    """
+    if not sorted_prices:
+        return None
+    middle = len(sorted_prices) // 2
+    if len(sorted_prices) % 2:
+        return sorted_prices[middle]
+    return (sorted_prices[middle - 1] + sorted_prices[middle] + 1) // 2
+
 
 def _unaccent(value: object) -> object:
     """Libellé comparé sans casse ni accents. `CITROËN` et `Citroën` se valent.
@@ -811,6 +965,14 @@ def _unaccent(value: object) -> object:
     majuscules accentuées. `unicodedata` retire les marques combinantes (NFKD),
     puis `casefold` règle la casse — y compris `ß` → `ss`, que `lower` ne fait
     pas.
+
+    **La modifier oblige à reconstruire l'index de cohorte.**
+    `idx_listings_cohort` (voir `_SCHEMA`) indexe `unaccent(...)`, une
+    expression qui appelle CETTE fonction ; SQLite ne sait pas qu'elle a
+    changé, donc les entrées déjà écrites gardent le résultat de l'ancienne et
+    les lignes concernées cessent de se joindre — sans erreur. Après toute
+    modification ici : `REINDEX` sur la base (ou `DROP INDEX` puis réouverture,
+    qui le recrée).
 
     Rend la valeur telle quelle si ce n'est pas une chaîne : la fonction est
     appelée dans du SQL, où `NULL` circule.

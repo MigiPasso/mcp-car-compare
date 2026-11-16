@@ -56,7 +56,7 @@ from .models import (
     SourceError,
     StructureChanged,
 )
-from .store import ListingFilter, Store
+from .store import ListingFilter, MarketGap, Store
 
 # Un site de petites annonces répond en ~0,5 s ; trente secondes est déjà une
 # panne. Le budget de `harvest` borne de toute façon l'attente page par page :
@@ -231,6 +231,28 @@ def register(
         faire sauter ou répéter une ligne à la frontière de page. Les doublons
         restent visibles à l'appelant, qui peut dédoublonner sur
         `(source, market, source_id)`.
+
+        Chaque annonce porte aussi son écart au marché, en quatre clés plates :
+        `market_median` (prix médian de ses comparables, `null` sans
+        comparable), `market_n` (nombre de comparables réellement utilisés),
+        `gap_eur` (`price - market_median`) et `gap_pct` (le même écart en pour
+        cent, arrondi à 0,1). Les comparables sont les annonces du corpus de
+        même `(make, group)` normalisé, de la même année à ±1 an, à prix
+        crédible (`models.PRICE_FLOOR_EUR`), **l'annonce elle-même exclue** :
+        sinon elle tirerait sa propre référence vers elle.
+
+        Deux moitiés indépendantes, et c'est voulu : `market_median` et
+        `market_n` décrivent LE MARCHÉ et existent que l'annonce soit chiffrable
+        ou non ; `gap_eur` et `gap_pct` décrivent CETTE ANNONCE face au marché,
+        et restent `null` quand son prix n'en est pas un (`price_plausible`) —
+        un prix à 1 € donnerait « −99,9 % », un chiffre calculé et faux. Sous
+        `models.MIN_COMPARABLES` comparables, les trois valeurs s'abstiennent et
+        `market_n` dit le compte exact : jamais d'estimation.
+
+        Un écart n'est pas une marge : aucun frais n'est calculé (TVA, import,
+        carte grise), les montants restent ceux du site. Et rien n'est stocké —
+        la référence est recalculée à chaque appel, parce qu'elle change dès que
+        le corpus grandit ; un chiffre figé la veille mentirait le lendemain.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
             raise ValueError(f"limit doit être un entier de 1 à {MAX_LIMIT}")
@@ -267,6 +289,7 @@ def register(
             items, has_more = store.page(
                 job_id, sort=job.sort, offset=offset, limit=limit
             )
+            references = store.market_gaps(items)
             following = None
             if has_more:
                 following = cursor_module.encode(
@@ -279,7 +302,11 @@ def register(
                 )
             return {
                 "items": [
-                    {**item.as_dict(), "price_plausible": price_is_plausible(item.price)}
+                    {
+                        **item.as_dict(),
+                        "price_plausible": price_is_plausible(item.price),
+                        **_market_gap(item, references[item.key()]),
+                    }
                     for item in items
                 ],
                 "next_cursor": following,
@@ -1009,6 +1036,50 @@ def _optional_int(raw: dict, key: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{key} doit être un entier ou nul : {value!r}")
     return value
+
+
+# --- écart au marché d'une offre ------------------------------------------------
+
+
+def _market_gap(listing: Listing, reference: MarketGap) -> dict:
+    """Les quatre clés d'écart au marché d'une annonce.
+
+    `market_median` et `market_n` décrivent le marché : ils existent que
+    l'annonce soit chiffrable ou non. `gap_eur` et `gap_pct` décrivent cette
+    annonce face au marché, et il n'y a pas d'écart à partir d'un prix qui n'en
+    est pas un — `price_is_plausible` en décide, jamais une copie du plancher
+    écrite ici.
+
+    Sous `MIN_COMPARABLES` comparables, les trois valeurs s'abstiennent et
+    `market_n` reste exact : une médiane sur cinq annonces se lirait comme un
+    prix de marché. Aucun frais n'est calculé : un écart n'est pas une marge.
+
+    `gap_pct` est dérivé des deux montants rendus (`gap_eur` et
+    `market_median`), pas d'un intermédiaire non arrondi : les deux chiffres ne
+    peuvent donc pas se contredire.
+    """
+    if reference.n < MIN_COMPARABLES:
+        return {
+            "market_median": None,
+            "market_n": reference.n,
+            "gap_eur": None,
+            "gap_pct": None,
+        }
+    median = reference.median
+    price = listing.price
+    gap_eur: int | None = None
+    gap_pct: float | None = None
+    # `median` n'est `None` que si la cohorte est vide, donc déjà écartée par
+    # le seuil ci-dessus : la garde sert au typage, pas à un cas réel.
+    if price is not None and median is not None and price_is_plausible(price):
+        gap_eur = price - median
+        gap_pct = round(gap_eur / median * 100, 1)
+    return {
+        "market_median": median,
+        "market_n": reference.n,
+        "gap_eur": gap_eur,
+        "gap_pct": gap_pct,
+    }
 
 
 # --- quantiles d'une analyse ---------------------------------------------------
