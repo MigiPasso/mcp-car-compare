@@ -239,7 +239,12 @@ def register(
         cent, arrondi à 0,1). Les comparables sont les annonces du corpus de
         même `(make, group)` normalisé, de la même année à ±1 an, à prix
         crédible (`models.PRICE_FLOOR_EUR`), **l'annonce elle-même exclue** :
-        sinon elle tirerait sa propre référence vers elle.
+        sinon elle tirerait sa propre référence vers elle. `market_n` compte des
+        ANNONCES COMPARABLES, une même voiture comptée une fois : une voiture
+        annoncée deux fois n'entre qu'une fois dans la série, sinon un doublon
+        pèserait double. Ce n'est pas « des voitures distinctes » — deux
+        voitures réellement distinctes qui partagent modèle, année, kilométrage
+        et prix se rabattent sur une, faute de donnée qui les sépare.
 
         Deux moitiés indépendantes, et c'est voulu : `market_median` et
         `market_n` décrivent LE MARCHÉ et existent que l'annonce soit chiffrable
@@ -253,6 +258,24 @@ def register(
         carte grise), les montants restent ceux du site. Et rien n'est stocké —
         la référence est recalculée à chaque appel, parce qu'elle change dès que
         le corpus grandit ; un chiffre figé la veille mentirait le lendemain.
+
+        Chaque annonce porte enfin `duplicate_of` : la `source_id` de l'autre
+        annonce du corpus qui décrit la MÊME voiture, `null` quand elle est
+        seule. Deux identifiants pour une même voiture, c'est mesuré (deux
+        annonces AutoScout24 à 15 900 €, 45 109 km, même vendeur, le
+        2026-11-28). **On ne fusionne pas** : les deux lignes restent, indexées
+        par leur propre `source_id`, et `duplicate_of` les relie — un couple se
+        cite mutuellement, donc une page qui n'en montre qu'une dit quand même
+        qu'une autre annonce existe ailleurs.
+
+        La clé est `(make, group)` normalisés + année + kilométrage + prix
+        exacts (`store._duplicate_key`), et sa limite est assumée : deux vendeurs
+        différents qui annoncent deux voitures réellement identiques ressortent
+        marqués l'un vers l'autre, donc deux opportunités restent deux lignes et
+        c'est à l'appelant de trancher. Une annonce dont l'année, le kilométrage
+        ou le prix manque n'est jamais marquée : une absence n'est pas une
+        valeur égale. Rien n'est stocké ici non plus — le marquage est recalculé
+        à chaque appel, comme la référence de marché.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
             raise ValueError(f"limit doit être un entier de 1 à {MAX_LIMIT}")
@@ -290,6 +313,7 @@ def register(
                 job_id, sort=job.sort, offset=offset, limit=limit
             )
             references = store.market_gaps(items)
+            duplicates = store.duplicate_marks(items)
             following = None
             if has_more:
                 following = cursor_module.encode(
@@ -306,6 +330,7 @@ def register(
                         **item.as_dict(),
                         "price_plausible": price_is_plausible(item.price),
                         **_market_gap(item, references[item.key()]),
+                        "duplicate_of": duplicates[item.key()],
                     }
                     for item in items
                 ],

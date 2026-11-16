@@ -309,8 +309,14 @@ def test_une_annonce_allemande_ne_se_chiffre_pas_contre_la_france(tmp_path):
     # l'annonce et pas par une constante : une annonce .de n'a que deux
     # comparables allemands, donc pas de référence — même si six comparables
     # français sont à côté. Sans le filtre, elle aurait une médiane française.
+    # Les deux allemandes diffèrent de 1 000 € : deux voitures, pas une annoncée
+    # deux fois — à prix identique elles porteraient la même clé de doublon et la
+    # cohorte n'en compterait qu'une (`store._duplicate_key`), donc ce test ne
+    # mesurerait plus le filtre de marché qu'il existe pour mesurer.
     francaises = cohorte(SIX_PRIX, prefix="fre")
-    allemandes = [car(f"de{index}", price=30_000, market="de") for index in range(2)]
+    allemandes = [
+        car(f"de{index}", price=30_000 + 1_000 * index, market="de") for index in range(2)
+    ]
     seed(tmp_path, [car("cible", price=20_000, market="de"), *francaises, *allemandes])
 
     annonce = offre(tmp_path)["cible"]

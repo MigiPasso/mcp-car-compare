@@ -408,8 +408,13 @@ def _filter_clause(parts: Sequence[_FilterPart]) -> tuple[str, tuple[object, ...
 # portent ni la même TVA ni les mêmes frais : leurs prix ne se comparent pas. Le
 # `source` est là pour la même raison, un site n'étant pas l'autre (AutoScout24
 # et LaCentrale n'affichent pas les mêmes prix pour la même voiture).
+# Le SELECT porte les cinq pièces de la clé de doublon : la cohorte écarte les
+# annonces qui répètent une voiture déjà comptée, et c'est `_duplicate_key` qui
+# décide de cette identité — pas le SQL, qui ne saurait pas dire qu'un
+# kilométrage inconnu n'est pas un kilométrage égal.
 _COHORT_SQL = (
-    'SELECT l."price" AS price FROM "listings" AS l '
+    'SELECT l."make" AS make, l."group" AS grp, l."year" AS year, '
+    'l."km" AS km, l."price" AS price FROM "listings" AS l '
     'WHERE unaccent(l."make") = unaccent(?) '
     'AND unaccent(l."group") = unaccent(?) '
     'AND l."year" BETWEEN ? AND ? '
@@ -420,12 +425,85 @@ _COHORT_SQL = (
 )
 
 
+# --- doublons : la même voiture annoncée plusieurs fois -----------------------
+# Mesuré le 2026-11-28 : deux annonces AutoScout24 portaient deux identifiants
+# différents pour la même voiture (15 900 €, 45 109 km, même vendeur). Le corpus
+# garde les DEUX lignes — on ne fusionne pas (PLAN.md §4) — et `offers` les
+# marque l'une vers l'autre.
+#
+# Ce SQL ne fait que choisir le SEAU que l'index de cohorte sait lire :
+# `(make, group)` normalisés et l'année exacte. Toute la décision est dans
+# `_duplicate_key`, en Python : les deux lecteurs de la clé (le marquage
+# ci-dessous et la cohorte de `market_gaps`) la calculent donc par le même code,
+# et une annonce marquée ne peut pas être comptée deux fois dans une médiane.
+# Recopier `km` ou `price` en SQL ici rendrait invisible une clé qui les
+# oublierait : le SQL filtrerait encore, et le test ne verrait rien.
+_DUPLICATE_BUCKET_SQL = (
+    'SELECT l."source" AS source, l."market" AS market, '
+    'l."source_id" AS source_id, l."make" AS make, l."group" AS grp, '
+    'l."year" AS year, l."km" AS km, l."price" AS price '
+    'FROM "listings" AS l '
+    'WHERE unaccent(l."make") = unaccent(?) '
+    'AND unaccent(l."group") = unaccent(?) '
+    'AND l."year" = ? '
+    'AND l."market" = ? '
+    'AND NOT (l."source" = ? AND l."market" = ? AND l."source_id" = ?) '
+    'ORDER BY l."source", l."market", l."source_id"'
+)
+
+
+def _duplicate_key(
+    market: str,
+    make: str,
+    group: str,
+    year: int | None,
+    km: int | None,
+    price: int | None,
+) -> tuple[str, str, str, int, int, int] | None:
+    """La clé d'une même voiture annoncée plusieurs fois, ou `None` s'il manque
+    une pièce.
+
+    `market`, `(make, group)` normalisés comme partout ailleurs (`unaccent`, donc
+    « CLIO » et « Clio » sont la même gamme), plus l'année, le kilométrage et le
+    prix EXACTS.
+
+    Le marché est dans la clé, la source n'y est pas — et ce n'est pas une
+    asymétrie gratuite. La source n'y est pas parce que le cas utile est la même
+    voiture vue sur deux sites français : c'est là que la comparaison de prix a
+    un sens. Le marché y est parce que deux marchés ne publient pas des prix
+    comparables (TVA, frais) : une annonce .fr et une .de au même prix
+    numérique ne désignent pas la même voiture, elles désignent deux voitures
+    différentes qui se trouvent coûter le même chiffre. Les marquer doublons
+    contredirait la règle que la cohorte applique déjà.
+
+    `None` quand l'année, le kilométrage ou le prix manque : `NULL` n'est pas
+    une valeur égale. Deux annonces du même modèle dont on ignore le kilométrage
+    ne sont pas pour autant la même voiture, et les rapprocher marquerait comme
+    doublons des annonces qui n'en sont pas — ou en écarterait une d'une médiane
+    de prix.
+
+    **La limite, dite plutôt que masquée** : cette clé ne distingue pas deux
+    voitures réellement identiques (même modèle, même année, même kilométrage,
+    même prix) chez deux vendeurs différents ; elles ressortent marquées l'une
+    vers l'autre. C'est précisément pourquoi le corpus ne FUSIONNE rien : les
+    deux lignes restent, avec leurs deux `source_id`, et `duplicate_of` est une
+    observation que l'appelant peut ignorer. Le vendeur n'entre pas dans la clé
+    parce que deux sources sur trois ne le donnent pas (LaCentrale 0/231,
+    Autohero 0/10) : une clé qui en dépendrait ne s'appliquerait qu'à une
+    source.
+    """
+    if year is None or km is None or price is None:
+        return None
+    return (market, str(_unaccent(make)), str(_unaccent(group)), year, km, price)
+
+
 @dataclass(frozen=True, slots=True)
 class MarketGap:
     """Les comparables d'une annonce, et leur médiane de prix.
 
     `n` compte les comparables réellement entrés dans la médiane — prix
-    crédibles, année à ±1 an, annonce exclue. `median` ne vaut `None` que
+    crédibles, année à ±1 an, annonce exclue, et une voiture annoncée deux fois
+    comptée une seule fois (`Store.market_gaps`). `median` ne vaut `None` que
     quand `n` vaut 0 : les deux champs disent la même chose sous deux formes,
     donc aucun des deux ne peut mentir seul.
 
@@ -885,6 +963,19 @@ class Store:
         cohorte — la fenêtre ±1 n'existe pas — et rend `n = 0`, jamais une
         cohorte élargie.
 
+        **`n` compte des ANNONCES COMPARABLES, une même voiture comptée une
+        fois** (`_duplicate_key`, la même clé que `duplicate_marks`), sinon un
+        doublon pèserait double dans la référence qui sert à juger les annonces.
+        Ce n'est pas la même chose que « des voitures distinctes », et le
+        vocabulaire compte : deux voitures réellement distinctes qui partagent
+        modèle, année, kilométrage et prix se rabattent sur une seule, parce
+        qu'aucune donnée du site ne permet de les séparer (le vendeur manque
+        chez deux sources sur trois). Le chiffre est donc un minorant honnête du
+        nombre de voitures, jamais une affirmation qu'elles sont distinctes.
+        Deux annonces dont la clé est incomplète (kilométrage inconnu) ne sont
+        pas rabattues l'une sur l'autre : elles restent deux prix, parce qu'on
+        ne sait pas qu'elles sont la même voiture.
+
         Le plancher de crédibilité n'est PAS écrit dans le SQL :
         `models.price_is_plausible` est la seule règle qui décide ce qu'est un
         prix, et elle filtre la série une fois lue. Un `price >= 100` recopié
@@ -907,13 +998,20 @@ class Store:
         return gaps
 
     def _comparable_prices(self, listing: Listing) -> list[int]:
-        """Les prix de la cohorte d'une annonce, triés croissant.
+        """Les prix de la cohorte d'une annonce, triés croissant, une voiture
+        dupliquée comptée une seule fois.
 
         Appelée une fois par annonce par `market_gaps`, qui documente la
         cohorte. L'année est dans le `WHERE` : un comparable sans année ne peut
         pas être « de la même année à ±1 an », et `NULL BETWEEN ? AND ?` n'est
         jamais vrai — l'absence s'exclut d'elle-même au lieu de passer pour
         n'importe quelle année.
+
+        La déduplication se fait ici, avec `_duplicate_key` : c'est la même
+        fonction que le marquage d'`offers`, donc une annonce marquée dupliquée
+        est exactement une annonce qui ne compte qu'une fois dans une médiane.
+        Le SQL ne dédoublonne pas lui-même (`SELECT DISTINCT` aurait tenu deux
+        kilométrages inconnus pour égaux, ce que la clé refuse).
 
         Le SQL est une constante nommée parce qu'un test le soumet à
         `EXPLAIN QUERY PLAN` : c'est ce qui prouve que l'index de cohorte est
@@ -935,7 +1033,94 @@ class Store:
                 listing.source_id,
             ),
         ).fetchall()
-        return [row["price"] for row in rows if price_is_plausible(row["price"])]
+        prices: list[int] = []
+        seen: set[tuple[str, str, int, int, int]] = set()
+        for row in rows:
+            # Toute la cohorte partage le marché de l'annonce (le SQL le filtre),
+            # donc `listing.market` est la valeur des lignes : la lire sur la
+            # ligne demanderait de la projeter pour rien.
+            key = _duplicate_key(
+                listing.market, row["make"], row["grp"], row["year"], row["km"], row["price"]
+            )
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            if price_is_plausible(row["price"]):
+                prices.append(row["price"])
+        return prices
+
+    # --- doublons -----------------------------------------------------------
+
+    def duplicate_marks(
+        self, listings: Sequence[Listing]
+    ) -> dict[tuple[str, str, str], str | None]:
+        """Pour chaque annonce, la `source_id` de l'autre annonce qui décrit la
+        MÊME voiture — `None` quand elle est seule au monde.
+
+        **On marque, on ne fusionne pas** (PLAN.md §4) : les deux lignes restent
+        dans le corpus avec leurs deux identifiants et leurs deux adresses. Deux
+        vendeurs différents qui annoncent deux voitures identiques restent donc
+        deux opportunités — la clé ne sait pas les distinguer (voir
+        `_duplicate_key`) — et c'est à l'appelant de trancher. Le corpus ne
+        décide pas à sa place.
+
+        Pour un couple, le marquage est MUTUEL : chaque annonce cite l'autre,
+        donc une page qui n'en montre qu'une dit quand même qu'une autre annonce
+        décrit la même voiture. Au-delà de deux annonces identiques, chacune cite
+        la première des autres dans l'ordre `(source, market, source_id)` : un
+        champ ne porte qu'un identifiant, et cet ordre est stable d'un appel à
+        l'autre.
+
+        La recherche porte sur TOUT le corpus, pas sur une récolte : « la même
+        voiture ailleurs » traverse les récoltes (`listings` est unique par
+        identité) et les sources (la clé n'en porte aucune). Une annonce lue par
+        une récolte plus ancienne est donc trouvée aussi — sinon le marquage
+        dépendrait de l'ordre des appels. La contrepartie, assumée : une
+        `source_id` rendue peut désigner une annonce qu'un `offers` restreint à
+        une récolte ne montre pas ; la ligne d'en face porte son propre
+        `source`, donc l'appelant peut la retrouver.
+
+        Une requête par annonce, comme `market_gaps` et pour la même raison : le
+        seau `(make, group, année)` est servi par `idx_listings_cohort`.
+        """
+        return {listing.key(): self._duplicate_of(listing) for listing in listings}
+
+    def _duplicate_of(self, listing: Listing) -> str | None:
+        """La `source_id` de la première autre annonce de la même voiture, ou
+        `None`. Appelée une fois par annonce par `duplicate_marks`, qui
+        documente la clé, le coût et le sens du marquage.
+        """
+        key = _duplicate_key(
+            listing.market,
+            listing.make,
+            listing.group,
+            listing.year,
+            listing.km,
+            listing.price,
+        )
+        if key is None:
+            return None
+        for row in self._conn.execute(
+            _DUPLICATE_BUCKET_SQL,
+            (
+                listing.make,
+                listing.group,
+                listing.year,
+                listing.market,
+                listing.source,
+                listing.market,
+                listing.source_id,
+            ),
+        ):
+            if (
+                _duplicate_key(
+                    row["market"], row["make"], row["grp"], row["year"], row["km"], row["price"]
+                )
+                == key
+            ):
+                return row["source_id"]
+        return None
 
 
 def _median_of(sorted_prices: Sequence[int]) -> int | None:
