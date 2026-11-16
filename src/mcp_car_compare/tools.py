@@ -622,10 +622,18 @@ async def _harvest_one(
             # banc d'AutoScout24).
             if announced_total is not None and len(seen) < announced_total:
                 truncated = True
+                # La phrase ne dit plus « plafond du site » : cette branche sert
+                # aussi une source qui rend tout son lot d'un coup, et là l'arrêt
+                # vient de `pages_max`, pas du site. Mesuré le 2026-11-28 : avec
+                # pages_max=3, LaCentrale rendait 71 annonces sur 100 et l'outil
+                # annonçait un plafond du site ; avec pages_max=10, elle rendait
+                # 100/100. Le chiffre qui manque est nommé, la cause reste
+                # inconnue du serveur : le dire vaut mieux que la deviner.
                 reason = (
-                    f"le site ne rend plus d'annonce après {len(seen)} distincte(s) "
-                    f"({read} lue(s)) alors qu'il en annonce {announced_total} : "
-                    "plafond du site atteint"
+                    f"lecture incomplète : arrêt après {len(seen)} annonce(s) "
+                    f"distincte(s) ({read} lue(s)) alors que la source en annonce "
+                    f"{announced_total} — plafond de lecture (pages_max="
+                    f"{criteria.pages_max}) ou de la source"
                 )
             break
         read += page.rendered

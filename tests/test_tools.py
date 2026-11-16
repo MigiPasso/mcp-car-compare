@@ -448,8 +448,8 @@ def test_an_empty_page_after_duplicates_still_reports_truncation(tmp_path):
     # Même comptabilité, autre sortie de boucle : le site s'arrête de rendre des
     # annonces après une page dont `read` a déjà atteint le total annoncé, mais
     # dont les annonces distinctes, elles, ne l'atteignent pas. Comparer `read`
-    # au total annoncé laissait `truncated=False` : le plafond du site se lisait
-    # comme une fin de marché.
+    # au total annoncé laissait `truncated=False` : une lecture incomplète se
+    # lisait comme une fin de marché.
     page_one = Page(
         listings=[listing(index) for index in range(19)], rendered=20, announced_total=20
     )
@@ -457,7 +457,13 @@ def test_an_empty_page_after_duplicates_still_reports_truncation(tmp_path):
     row = harvest(mcp, {"pages_max": 5})["coverage"][0]
     assert (row["read"], row["unique"]) == (20, 19)
     assert row["truncated"] is True
-    assert "plafond du site" in row["reason"]
+    # Le message nomme l'écart et laisse la cause ouverte : « plafond du site »
+    # était faux quand l'arrêt venait de `pages_max` (mesuré : 71/100 avec
+    # pages_max=3, 100/100 avec pages_max=10). Ce sont les deux nombres qui
+    # disent qu'il manque quelque chose.
+    assert "lecture incomplète" in row["reason"]
+    assert "19 annonce(s) distincte(s)" in row["reason"]
+    assert "20" in row["reason"]
 
 
 def test_harvest_says_when_pages_max_cut_it_short(tmp_path):
