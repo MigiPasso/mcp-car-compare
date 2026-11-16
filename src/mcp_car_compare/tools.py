@@ -203,6 +203,12 @@ def register(
         return {
             "job_id": job_id,
             "coverage": [row.as_dict() for row in coverage],
+            # Une lecture incomplète doit SAUTER AUX YEUX, pas se découvrir en
+            # lisant `coverage` ligne par ligne : un appelant qui ne voit que
+            # `job_id` croit avoir tout le marché. Le message dit combien il
+            # manque ET quel levier tourner — sans quoi « incomplet » s'entend
+            # comme une fatalité.
+            "warnings": _truncation_warnings(coverage, crit.pages_max),
             "cursor": cursor_module.encode(
                 Cursor(
                     job_id=job_id,
@@ -406,6 +412,36 @@ def register(
             "coverage": coverage.as_dict(),
             "warnings": warnings,
         }
+
+
+def _truncation_warnings(
+    coverage: list[SourceCoverage], pages_max: int
+) -> list[str]:
+    """Une phrase par source qui s'est arrêtée avant la fin, avec le levier.
+
+    Rendue vide quand tout a été lu : c'est ce qui permet à un test de dire
+    « pas d'avertissement sur une récolte complète » et donc de réfuter un
+    message qui crierait au loup à chaque appel.
+
+    Le levier proposé est `MAX_PAGES`, pas `pages_max * 2` : un appelant qui
+    relit la même réponse ne doit pas se voir conseiller une valeur différente à
+    chaque fois, et le plafond du site est de toute façon la seule borne utile.
+    """
+    warnings: list[str] = []
+    for row in coverage:
+        if not row.truncated:
+            continue
+        total = row.announced_total
+        if total is not None and total <= row.unique:
+            continue
+        lues = f"{row.unique} annonce(s) lue(s)"
+        annonce = f" sur {total} annoncée(s)" if total is not None else " (total annoncé inconnu)"
+        if pages_max < MAX_PAGES:
+            suite = f"relance avec pages_max={MAX_PAGES} pour élargir"
+        else:
+            suite = "le plafond de lecture est déjà au maximum : c'est la source qui s'arrête là"
+        warnings.append(f"{row.source} ({row.market}) : {lues}{annonce} — {suite}")
+    return warnings
 
 
 # --- réseau -------------------------------------------------------------------

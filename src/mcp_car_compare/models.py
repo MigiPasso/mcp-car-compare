@@ -241,7 +241,7 @@ class Criteria:
     gear: str = ""
     markets: tuple[str, ...] = ("fr",)
     sources: tuple[str, ...] = ("autoscout24",)
-    pages_max: int = 5
+    pages_max: int = 10
     sort: str = DEFAULT_SORT
 
 

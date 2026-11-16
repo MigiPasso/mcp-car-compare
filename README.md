@@ -140,7 +140,7 @@ stdio : rien d'autre à configurer, aucun port, aucun jeton.
 | Outil | Arguments | Rend |
 |---|---|---|
 | `list_brands` | `source?` (`autoscout24`), `market?` (`fr` ou `de`) | `{source, market, brands: [{value, label}], error}` — un **GET réel** chez le site (~0,5 s), aucun `coverage` (aucune récolte) ; un site en échec rend `error` et `brands` vide, l'outil ne lève pas. `market` compte : les libellés sont rendus dans la langue du marché (`Série 3` en `.fr`, `3er` en `.de`), et c'est le libellé rendu ici que `harvest` attend. `models` **n'est pas rempli en v1** : la taxonomie ne porte les modèles d'une marque que sur une page déjà filtrée sur elle, donc la clé est absente plutôt que présente et toujours vide |
-| `harvest` | `criteria`, `budget_s`, `sources?` | `{job_id, coverage, cursor}` — une ligne de `coverage` par source, celle de **cette** récolte |
+| `harvest` | `criteria`, `budget_s`, `sources?` | `{job_id, coverage, cursor, warnings}` — une ligne de `coverage` par source, celle de **cette** récolte. `warnings` prévient quand la source annonce plus d'annonces qu'on n'en a lu, avec le réglage à tourner (`pages_max`, défaut 10, plafond 20) |
 | `offers` | `job_id`, `cursor?`, `limit` | `{items, next_cursor, has_more, coverage}` — le corpus, jamais la somme des récoltes |
 
 `criteria` suit le contrat figé de `src/mcp_car_compare/models.py` :

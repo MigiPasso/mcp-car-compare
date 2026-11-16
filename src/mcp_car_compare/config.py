@@ -30,7 +30,7 @@ from .models import MAX_BUDGET_S, MAX_PAGES
 # plutôt que de déposer une base dans le répertoire courant.
 DEFAULT_DB = Path("/data/corpus.db")
 DEFAULT_BUDGET_S = 60
-DEFAULT_PAGES_MAX = 5
+DEFAULT_PAGES_MAX = 10
 DEFAULT_LOG_LEVEL = "INFO"
 
 

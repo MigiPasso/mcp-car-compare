@@ -28,7 +28,9 @@ def test_sans_variable_les_defauts_sont_ceux_de_l_image() -> None:
     assert loaded.db_path == config.DEFAULT_DB
     assert loaded.db_path == type(loaded.db_path)("/data/corpus.db")
     assert loaded.budget_s == 60
-    assert loaded.pages_max == 5
+    # Dix par défaut : une valeur trop basse est ce qui a produit « 7 Série 3
+    # sur 100 » en usage réel. Le plafond reste 20 (`MAX_PAGES`).
+    assert loaded.pages_max == 10
     assert loaded.log_level == "INFO"
 
 

@@ -393,7 +393,7 @@ def test_harvest_returns_a_job_its_coverage_and_an_entry_cursor(tmp_path):
     source = FakeSource([Page(listings=[listing(index) for index in range(3)], announced_total=3)])
     mcp = install(tmp_path, source)
     result = harvest(mcp, {"pages_max": 2})
-    assert set(result) == {"job_id", "coverage", "cursor"}
+    assert set(result) == {"job_id", "coverage", "cursor", "warnings"}
     assert len(result["coverage"]) == 1
     row = result["coverage"][0]
     assert set(row) == {
@@ -969,3 +969,23 @@ def test_the_corpus_path_comes_from_the_configuration_when_not_passed(tmp_path, 
     result = harvest(mcp, {})
     assert (tmp_path / "from-config.db").exists()
     assert len(mcp.tools["offers"](result["job_id"], None, 25)["items"]) == 1
+
+
+def test_une_recolte_tronquee_previent_avec_le_levier(tmp_path):
+    # Le propriétaire l'a demandé explicitement : si la source annonce plus
+    # d'annonces qu'on n'en a lu, l'appelant doit être prévenu — sinon il croit
+    # avoir tout le marché — et le message doit dire QUEL réglage tourner.
+    source = FakeSource([Page(listings=[listing(index) for index in range(20)], announced_total=500)])
+    mcp = install(tmp_path, source)
+    result = harvest(mcp, {"pages_max": 2})
+    (warning,) = result["warnings"]
+    assert "autoscout24" in warning and "20 annonce(s) lue(s) sur 500" in warning
+    assert "pages_max=20" in warning
+
+
+def test_une_recolte_complete_ne_previent_de_rien(tmp_path):
+    # Le pendant indispensable : un avertissement qui crie toujours ne prévient
+    # plus de rien. Tout est lu, donc rien à dire.
+    source = FakeSource([Page(listings=[listing(index) for index in range(3)], announced_total=3)])
+    mcp = install(tmp_path, source)
+    assert harvest(mcp, {"pages_max": 2})["warnings"] == []
