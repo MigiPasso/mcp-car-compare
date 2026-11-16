@@ -201,12 +201,24 @@ ne l'inclut pas.
 Chaque étape est indépendante et vérifiable seule. Preuve = commande exécutable
 dans Docker, pas une affirmation.
 
-**État au 16/11** — périmètre A livré (commit `6b0abc9`, puis `0978265`) : **E0**,
-**E2**, **E5** faits et prouvés, **E8** fait à deux tiers (l'image et la config
-des clients marchent ; l'enchaînement `harvest` → `offers` a été prouvé contre
-le site réel par un vérificateur, pas par un test automatisé). **E6** est devenu
-la prochaine étape : c'est ce qui répond à la question posée, et il ne demande
-ni navigateur ni nouvelle source.
+**État au 28/11** — **E6 est livré** (commit `ec70ffd`) : quatrième outil
+`analyze_models` (agrégats par `(make, group)`, prix crédibles seulement,
+abstention sous 6 comparables), 278 tests, image reconstruite et branchée dans
+`~/.pi/agent/mcp.json` avec les quatre outils. **Restent E3 + E4** (Autohero et
+LaCentrale, un seul lot : ils partagent le même navigateur) **et E7** (dédup,
+inutile avant deux sources).
+
+**Méthode de travail convenue avec l'opérateur** : les décisions
+d'implémentation passent par un council à trois conseillers, le superviseur
+tranche, et l'opérateur ne voit que la décision. Critère de jugement : *simple
+et efficace, pas d'usine à gaz.*
+
+**`council-glm` est exclu du council** (décision de l'opérateur, 2026-11-16) :
+sur trois passes de suite il a rendu « rapport prêt » sans rapport structuré,
+même avec un budget de lectures explicite. Roster de remplacement :
+`council-deepseek` + `reviewer`, et `oracle` (fork) quand il faut un troisième
+avis. Tout brief de conseiller ou de vérificateur porte un **budget d'étapes** :
+sans ça, l'agent meurt en essayant d'être exhaustif et ne rend rien.
 
 **E1 mesuré le 16/11 — Autohero est niveau 3.** `curl` sur `/fr/search/` rend
 **12 annonces** (blocs JSON-LD `Product`, avec prix, `productID`, image) sur
