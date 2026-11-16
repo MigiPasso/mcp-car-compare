@@ -201,13 +201,24 @@ ne l'inclut pas.
 Chaque étape est indépendante et vérifiable seule. Preuve = commande exécutable
 dans Docker, pas une affirmation.
 
-**État au 16/11** — périmètre A livré (commit `6b0abc9`) : **E0**, **E2**, **E5**
-faits et prouvés, **E8** fait à deux tiers (l'image et la config des clients
-marchent ; l'enchaînement `harvest` → `offers` a été prouvé contre le site réel
-par un vérificateur, pas par un test automatisé). **E1, E3, E4, E6, E7** restent
-dehors : Autohero, LaCentrale, `analyze_models` et la dédup inter-sources.
-228 tests, dont les corrected du lot de review ; trois reviews ont déclaré zéro
-P0/P1 confirmé, et les dernières corrections ont été revues à part.
+**État au 16/11** — périmètre A livré (commit `6b0abc9`, puis `0978265`) : **E0**,
+**E2**, **E5** faits et prouvés, **E8** fait à deux tiers (l'image et la config
+des clients marchent ; l'enchaînement `harvest` → `offers` a été prouvé contre
+le site réel par un vérificateur, pas par un test automatisé). **E6** est devenu
+la prochaine étape : c'est ce qui répond à la question posée, et il ne demande
+ni navigateur ni nouvelle source.
+
+**E1 mesuré le 16/11 — Autohero est niveau 3.** `curl` sur `/fr/search/` rend
+**12 annonces** (blocs JSON-LD `Product`, avec prix, `productID`, image) sur
+**3 085 annoncées**, et **aucun paramètre de pagination ne change la page**
+(`page=2`, `p=2`, `start=12`, `offset=12` → HTML identique au octet près, mêmes
+12 produits). Pas de `__NEXT_DATA__`, pas de RSC, aucun chemin `/api/` dans les
+bundles, `/graphql` et `/api/search` en 404. Les 3 085 véhicules se chargent
+côté client.
+
+**Conséquence de plan** : E3 (Autohero) et E4 (LaCentrale) exigent désormais la
+**même** infrastructure de navigateur. Faire Autohero seul n'achète plus de gain
+incrémental — les deux sources se font dans le même lot, ou pas du tout.
 
 | # | Étape | Preuve (dans Docker) |
 |---|---|---|
