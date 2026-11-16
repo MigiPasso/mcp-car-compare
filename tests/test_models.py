@@ -47,6 +47,23 @@ def test_un_rendered_inferieur_a_ce_que_la_page_porte_est_refuse():
         Page(listings=[object(), object()], rendered=1)
 
 
+def test_has_more_est_faux_par_defaut():
+    # Une source qui ne s'est pas arrêtée avant la fin n'a rien à déclarer :
+    # `has_more` ne vaut `True` que si l'adaptateur l'affirme. Un défaut à `True`
+    # ferait de toute récolte une récolte tronquée, donc un `truncated` qui ne
+    # veut plus rien dire.
+    assert Page(listings=[]).has_more is False
+
+
+def test_has_more_traverse_la_construction():
+    # Le champ est le seul canal par lequel un adaptateur qui lit un lot de
+    # plusieurs pages dit qu'il a coupé ; s'il ne survivait pas à la
+    # construction, `coverage.truncated` resterait faux sur une lecture
+    # partielle quand le site n'annonce aucun total (voir `tools._harvest_one`).
+    page = Page(listings=[], announced_total=None, has_more=True)
+    assert page.has_more is True
+
+
 # --- prix crédible -------------------------------------------------------------
 
 def test_un_prix_a_un_euro_n_est_pas_un_prix():

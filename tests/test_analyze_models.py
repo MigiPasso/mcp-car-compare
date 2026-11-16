@@ -125,12 +125,15 @@ def test_n_priced_est_exactement_la_longueur_de_la_serie_rendue(tmp_path):
         groups, _ = store.model_groups(ListingFilter(), price_floor=PRICE_FLOOR_EUR, limit=30)
         series = store.group_prices(
             ListingFilter(),
-            [(group.make, group.group) for group in groups],
+            [(group.make_key, group.group_key) for group in groups],
             price_floor=PRICE_FLOOR_EUR,
         )
-    assert [(group.n, group.n_priced, len(series[(group.make, group.group)])) for group in groups] == [
-        (5, 3, 3)
-    ]
+    # La jointure passe par la CLÉ normalisée, celle que `model_groups` a groupée
+    # et que `group_prices` reçoit : deux chiffres qui doivent dire la même chose.
+    assert [
+        (group.n, group.n_priced, len(series[(group.make_key, group.group_key)]))
+        for group in groups
+    ] == [(5, 3, 3)]
 
 
 # --- D4 : abstention sous six comparables --------------------------------------

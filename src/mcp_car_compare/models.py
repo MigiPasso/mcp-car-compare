@@ -30,7 +30,12 @@ SOURCES = ("autoscout24", "autohero", "lacentrale")
 # ne disent pas la même chose à l'appelant. Le périmètre s'écrit ici une fois et
 # nulle part ailleurs : `tools` le lit pour refuser au parsage des critères, et
 # c'est la même liste que la fabrique d'adaptateurs cite.
-SERVED_SOURCES = ("autoscout24",)
+#
+# `lacentrale` y est parce qu'un adaptateur existe, pas parce que le site répond
+# en httpx : DataDome impose un side-car navigateur, et l'adaptateur parle à ce
+# side-car. Une source servie par un autre transport reste servie — l'appelant
+# n'a pas à savoir lequel.
+SERVED_SOURCES = ("autoscout24", "lacentrale")
 
 MARKETS = ("fr", "de")
 FUELS = ("essence", "diesel", "electrique", "hybride", "")
@@ -164,12 +169,21 @@ class Page:
     entier est refusé ici, à la construction : un `rendered` textuel passait en
     silence, puis se comparait à `<= 0` dans la récolte, donc la panne surgissait
     loin de sa cause.
+
+    `has_more` est le seul canal par lequel une source dit qu'elle s'est
+    ARRÊTÉE AVANT LA FIN alors qu'elle a rendu des annonces : un adaptateur qui
+    lit un lot de plusieurs pages d'un coup (LaCentrale, dont le side-car
+    navigateur enchaîne les pages en une session) sait qu'il a coupé, et sans
+    ce champ la récolte concluait `truncated=False` quand le site n'annonçait
+    aucun total — donc « source couverte » sur une lecture partielle. Il vaut
+    `False` par défaut : une source qui n'a rien à déclarer n'a pas à le dire.
     """
 
     listings: list[Listing]
     announced_total: int | None
     page_number: int
     rendered: int
+    has_more: bool
 
     def __init__(
         self,
@@ -177,6 +191,7 @@ class Page:
         announced_total: int | None = None,
         page_number: int = 1,
         rendered: int | None = None,
+        has_more: bool = False,
     ) -> None:
         """`rendered=None` : la page a rendu ce qu'elle porte, donc une source
         qui ne dédoublonne pas n'a rien à déclarer, et une doublure de test
@@ -195,6 +210,7 @@ class Page:
         self.listings = listings
         self.announced_total = announced_total
         self.page_number = page_number
+        self.has_more = has_more
         if rendered is None:
             self.rendered = len(listings)
         elif isinstance(rendered, bool) or not isinstance(rendered, int):

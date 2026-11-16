@@ -139,6 +139,39 @@ def test_read_is_unique_plus_dropped_duplicates_plus_dropped_invalid(tmp_path):
     )
 
 
+def test_une_source_qui_s_arrete_avant_la_fin_ne_se_dit_pas_couverte(tmp_path):
+    # Le cas qui a motivé `Page.has_more` : une source qui lit un lot de
+    # plusieurs pages d'un coup et s'arrête avant la fin, sans total annoncé.
+    # Sans ce canal, la page 2 (vide) terminait la boucle avec `truncated=False`
+    # et `status="ok"` : une lecture partielle présentée comme un marché couvert.
+    # C'est exactement ce que `coverage` existe pour empêcher (PLAN.md §5).
+    class PartialBatch(ScriptedSource):
+        async def search(self, criteria: Criteria, page_number: int) -> Page:
+            if page_number > 1:
+                return Page(listings=[])
+            # `announced_total=None` : le site ne dit pas combien il annonce, et
+            # c'est là que le défaut apparaissait.
+            return Page(
+                listings=[listing(0), listing(1)],
+                announced_total=None,
+                has_more=True,
+            )
+
+    row = harvest(install(tmp_path, PartialBatch([])))["coverage"][0]
+    assert (row["read"], row["unique"]) == (2, 2)
+    assert row["truncated"] is True
+    assert "s'est arrêtée avant la fin" in row["reason"]
+
+
+def test_un_lot_declare_complet_ne_se_dit_pas_tronque(tmp_path):
+    # L'autre sens doit être vrai aussi : `has_more=False` (le défaut) ne rend
+    # pas toute récolte tronquée, sinon le drapeau ne dit plus rien.
+    mcp = install(tmp_path, ScriptedSource([[0, 1]]))
+    row = harvest(mcp)["coverage"][0]
+    assert row["truncated"] is False
+    assert row["reason"] == ""
+
+
 def test_every_reported_status_belongs_to_the_contract(tmp_path):
     # Deux marchés du même site : l'un répond, l'autre échoue. Les deux statuts
     # rendus doivent appartenir au vocabulaire fermé de `coverage` — sinon un

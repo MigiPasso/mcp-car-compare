@@ -253,6 +253,8 @@ class ModelGroup:
     `None` quand aucune ne le porte : l'absence est dite, jamais comblée.
     """
 
+    make_key: str
+    group_key: str
     make: str
     group: str
     group_label: str
@@ -658,42 +660,51 @@ class Store:
         where = f"WHERE {clause}" if clause else ""
         rows = self._conn.execute(
             f'WITH f AS ('
-            'SELECT l."make" AS make_, l."group" AS grp, l."group_label" AS label_, '
+            # La clé de groupe est NORMALISÉE (casse et accents) : AutoScout24
+            # écrit « Clio » et LaCentrale « CLIO », et sans ça le même modèle
+            # sortait en deux lignes — mesuré le 2026-11-28 sur une récolte à
+            # deux sources. Le libellé affiché reste celui du site.
+            'SELECT unaccent(l."make") AS make_key, unaccent(l."group") AS grp_key, '
+            'l."make" AS make_raw, l."group" AS grp_raw, l."group_label" AS label_, '
             'l."year" AS year_, l."km" AS km_, l."price" AS price_ '
             f'FROM "listings" AS l {where}), '
             'years AS ('
-            'SELECT make_, grp, AVG(year_) AS median_ FROM ('
-            'SELECT make_, grp, year_, '
-            'ROW_NUMBER() OVER (PARTITION BY make_, grp ORDER BY year_) AS rn, '
-            'COUNT(*) OVER (PARTITION BY make_, grp) AS cnt '
+            'SELECT make_key, grp_key, AVG(year_) AS median_ FROM ('
+            'SELECT make_key, grp_key, year_, '
+            'ROW_NUMBER() OVER (PARTITION BY make_key, grp_key ORDER BY year_) AS rn, '
+            'COUNT(*) OVER (PARTITION BY make_key, grp_key) AS cnt '
             'FROM f WHERE year_ IS NOT NULL) '
-            'WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2) GROUP BY make_, grp), '
+            'WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2) GROUP BY make_key, grp_key), '
             'kms AS ('
-            'SELECT make_, grp, AVG(km_) AS median_ FROM ('
-            'SELECT make_, grp, km_, '
-            'ROW_NUMBER() OVER (PARTITION BY make_, grp ORDER BY km_) AS rn, '
-            'COUNT(*) OVER (PARTITION BY make_, grp) AS cnt '
+            'SELECT make_key, grp_key, AVG(km_) AS median_ FROM ('
+            'SELECT make_key, grp_key, km_, '
+            'ROW_NUMBER() OVER (PARTITION BY make_key, grp_key ORDER BY km_) AS rn, '
+            'COUNT(*) OVER (PARTITION BY make_key, grp_key) AS cnt '
             'FROM f WHERE km_ IS NOT NULL) '
-            'WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2) GROUP BY make_, grp) '
-            'SELECT g.make_ AS make, g.grp AS grp, g.label_ AS group_label, '
+            'WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2) GROUP BY make_key, grp_key) '
+            'SELECT g.make_key AS make_key, g.grp_key AS grp_key, '
+            'g.make AS make, g.grp AS grp, g.label_ AS group_label, '
             'g.n AS n, g.n_priced AS n_priced, '
             'y.median_ AS year_median, k.median_ AS km_median '
-            'FROM (SELECT make_, grp, MAX(label_) AS label_, COUNT(*) AS n, '
+            'FROM (SELECT make_key, grp_key, MAX(make_raw) AS make, MAX(grp_raw) AS grp, MAX(label_) AS label_, COUNT(*) AS n, '
             'SUM(CASE WHEN price_ >= ? THEN 1 ELSE 0 END) AS n_priced '
-            'FROM f GROUP BY make_, grp) AS g '
-            'LEFT JOIN years AS y ON y.make_ = g.make_ AND y.grp = g.grp '
-            'LEFT JOIN kms AS k ON k.make_ = g.make_ AND k.grp = g.grp '
-            'ORDER BY g.n DESC, g.make_, g.grp LIMIT ?',
+            'FROM f GROUP BY make_key, grp_key) AS g '
+            'LEFT JOIN years AS y ON y.make_key = g.make_key AND y.grp_key = g.grp_key '
+            'LEFT JOIN kms AS k ON k.make_key = g.make_key AND k.grp_key = g.grp_key '
+            'ORDER BY g.n DESC, g.make_key, g.grp_key LIMIT ?',
             (*params, price_floor, limit),
         ).fetchall()
         total = self._conn.execute(
             'SELECT COUNT(*) FROM ('
-            f'SELECT 1 FROM "listings" AS l {where} GROUP BY l."make", l."group")',
+            f'SELECT 1 FROM "listings" AS l {where} '
+            'GROUP BY unaccent(l."make"), unaccent(l."group"))',
             params,
         ).fetchone()[0]
         return (
             [
                 ModelGroup(
+                    make_key=row["make_key"],
+                    group_key=row["grp_key"],
                     make=row["make"],
                     group=row["grp"],
                     group_label=row["group_label"],
@@ -728,12 +739,19 @@ class Store:
         if not groups:
             return series
         clause, params = _filter_clause(_filter_parts(listing_filter))
-        keys = " OR ".join('(l."make" = ? AND l."group" = ?)' for _ in groups)
+        # Même normalisation que `model_groups` : les groupes rendus portent la
+        # clé, la jointure ne peut donc pas manquer une annonce que le
+        # regroupement a comptée.
+        keys = " OR ".join(
+            '(unaccent(l."make") = unaccent(?) AND unaccent(l."group") = unaccent(?))'
+            for _ in groups
+        )
         extra = f" AND {clause}" if clause else ""
         rows = self._conn.execute(
-            'SELECT l."make" AS make, l."group" AS grp, l."price" AS price '
+            'SELECT unaccent(l."make") AS make_key, unaccent(l."group") AS grp_key, '
+            'l."price" AS price '
             f'FROM "listings" AS l WHERE ({keys}) AND l."price" >= ?{extra} '
-            'ORDER BY l."make", l."group", l."price"',
+            'ORDER BY make_key, grp_key, l."price"',
             (
                 *(value for group in groups for value in group),
                 price_floor,
@@ -741,7 +759,7 @@ class Store:
             ),
         ).fetchall()
         for row in rows:
-            series[(row["make"], row["grp"])].append(row["price"])
+            series[(row["make_key"], row["grp_key"])].append(row["price"])
         return series
 
     def unmatched_filters(

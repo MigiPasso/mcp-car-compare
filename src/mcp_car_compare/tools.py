@@ -350,7 +350,7 @@ def register(
             )
             series = store.group_prices(
                 listing_filter,
-                [(group.make, group.group) for group in groups],
+                [(group.make_key, group.group_key) for group in groups],
                 price_floor=PRICE_FLOOR_EUR,
             )
             unmatched = store.unmatched_filters(listing_filter)
@@ -366,7 +366,7 @@ def register(
                 f"valeurs présentes dans le corpus : {present}"
             )
         for group in groups:
-            prices = series[(group.make, group.group)]
+            prices = series[(group.make_key, group.group_key)]
             median = quartile_low = quartile_high = None
             if group.n_priced < MIN_COMPARABLES:
                 warnings.append(
@@ -436,6 +436,8 @@ def _default_source(
 
     `market` est celui de `list_brands` : `search()` prend le sien dans les
     critères, et une même instance sert toutes les paires `(source, market)`.
+    Sauf `lacentrale`, qui est française uniquement : son constructeur refuse un
+    marché autre que `fr` (`sources/lacentrale.py`).
 
     Le périmètre n'est pas une liste écrite ici : `models.SERVED_SOURCES` le
     porte une seule fois, et c'est la même que ce module cite quand il refuse un
@@ -445,6 +447,13 @@ def _default_source(
         from .sources.autoscout24 import Autoscout24
 
         return Autoscout24(client, market)
+    if source == "lacentrale":
+        from .sources.lacentrale import Lacentrale
+
+        # Le client de la récolte porte AUSSI la requête au side-car navigateur :
+        # une seule fabrique, un seul pool, et les tests n'ont qu'un transport
+        # factice à fournir pour les deux transports.
+        return Lacentrale(client, market)
     raise UnsupportedSource(
         f"source {source!r} hors périmètre v1 : aucun adaptateur dans ce lot "
         f"(servie(s) : {', '.join(SERVED_SOURCES)})"
@@ -557,12 +566,21 @@ async def _harvest_one(
     même — « je me suis arrêté sans savoir » ne doit jamais se lire comme « j'ai
     tout lu ». Une récolte de 400 annonces sur un marché qui en annonce 12 479 ne
     doit jamais se lire comme complète.
+
+    `has_more` d'une page est la seconde façon de s'arrêter avant la fin, et la
+    seule qu'une source puisse déclarer elle-même : un adaptateur qui lit
+    plusieurs pages du site en une requête sait qu'il a coupé, et le dit par
+    `Page.has_more` (voir `models.Page`).
     """
     seen: set[tuple[str, str, str]] = set()
     read = 0
     dropped = 0
     dropped_invalid = 0
     announced_total: int | None = None
+    # `has_more` s'ACCUMULE sur les pages déjà lues : la page 2 d'un lot rend
+    # une page vide et sans suite (`has_more=False`), et l'écraser effacerait
+    # l'aveu de troncature fait par la page 1 — le seul qui compte.
+    has_more = False
     status = "ok"
     truncated = False
     reason = ""
@@ -593,6 +611,7 @@ async def _harvest_one(
             break
         if announced_total is None:
             announced_total = page.announced_total
+        has_more = has_more or page.has_more
         if page.rendered <= 0:
             # Page vide : la source est épuisée, OU elle a atteint son propre
             # plafond (AutoScout24 s'arrête à 20 pages, soit 400 annonces, et
@@ -652,6 +671,20 @@ async def _harvest_one(
             reason += ", total annoncé inconnu"
         else:
             reason += f" alors que le site en annonce {announced_total}"
+    # Une source qui déclare elle-même s'être arrêtée avant la fin ne peut pas se
+    # lire comme couverte. Sans cette ligne, un lot partiel rendu par LaCentrale
+    # (`partial` du side-car, porté par `Page.has_more`) sortait `truncated=False`
+    # quand le site n'annonçait aucun total : `status="ok"` sur une lecture
+    # partielle, soit exactement la fausse complétude que `coverage` existe pour
+    # empêcher. Le `reason` est composé, pas écrasé : un plafond déjà nommé
+    # (budget, `pages_max`) reste dit.
+    if has_more:
+        stopped = (
+            f"la source s'est arrêtée avant la fin après {len(seen)} annonce(s) "
+            f"distincte(s) ({read} lue(s))"
+        )
+        truncated = True
+        reason = f"{reason} ; {stopped}" if reason else stopped
     coverage = SourceCoverage(
         source=source_name,
         market=market,
@@ -786,6 +819,23 @@ def _parse_criteria(raw: dict, *, pages_max: int) -> Criteria:
             f"source(s) hors périmètre de ce lot : {', '.join(unserved)} "
             f"(servie(s) : {', '.join(SERVED_SOURCES)})"
         )
+    # LaCentrale ne filtre ni le carburant ni la boîte : ses paramètres de requête
+    # ne sont pas validés (mesuré au lab, voir ICH). Les accepter puis ne rien
+    # filtrer donnerait des compteurs de couverture faux — la récolte compterait
+    # comme lues des annonces qui ne correspondent pas — et filtrer après lecture
+    # serait pire : `read` compterait des annonces jetées. Le refus tombe donc au
+    # parsage, en nommant la source et le critère fautif.
+    if "lacentrale" in sources:
+        for key, value, label in (
+            ("fuel", fuel, "le carburant"),
+            ("gear", gear, "la boîte"),
+        ):
+            if value:
+                raise ValueError(
+                    f"source lacentrale : elle ne filtre pas {label} "
+                    f"({key}={value!r}) — retire ce critère ou interroge "
+                    f"AutoScout24 seul"
+                )
     # `pages_max` des critères prime sur celui de la configuration : c'est un
     # plafond par appel, pas un réglage global. Absent, c'est la configuration
     # qui décide ; zéro est refusé plus bas (un plafond nul ne récolte rien, et

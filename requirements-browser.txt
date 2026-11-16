@@ -1,0 +1,20 @@
+# Dépendances du SEUL side-car navigateur (LaCentrale). Rien d'autre dans
+# l'image n'en a besoin : le serveur MCP parle httpx, et `Dockerfile.test` ne
+# les installe pas — un test ne lance jamais de navigateur.
+#
+# `camoufox[geoip]==0.5.8` est épinglé, et l'extra `geoip` ne peut pas être
+# retiré : c'est la base GeoIP que `geoip=True` lit au lancement, et une
+# Camoufox sans elle rend une empreinte incohérente (fuseau et langue du
+# serveur, pas du marché). La version est celle du bras de référence mesuré le
+# 2026-11-12 (`ICH/docs/recon/lacentrale-firefox-vs-camoufox.md` : 24 cartes en
+# ~6,5 s, aucun défi) ; la 0.4.1 était bloquée par DataDome. L'épingler fige
+# aussi la version du navigateur téléchargé au build (`python -m camoufox
+# fetch`), donc deux constructions à un an d'écart donnent la même empreinte.
+camoufox[geoip]==0.5.8
+
+# Le side-car est un service HTTP local (127.0.0.1:8899) : FastAPI pour la
+# route, uvicorn comme serveur ASGI. Pas de plancher serré pour ces deux-là —
+# ils n'ont aucune API exotique ici (une route JSON, un /health) — mais un
+# plancher explicite, sinon `pip` prend ce que le miroir propose.
+fastapi>=0.115
+uvicorn>=0.34
