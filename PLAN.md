@@ -201,6 +201,14 @@ ne l'inclut pas.
 Chaque étape est indépendante et vérifiable seule. Preuve = commande exécutable
 dans Docker, pas une affirmation.
 
+**État au 16/11** — périmètre A livré (commit `6b0abc9`) : **E0**, **E2**, **E5**
+faits et prouvés, **E8** fait à deux tiers (l'image et la config des clients
+marchent ; l'enchaînement `harvest` → `offers` a été prouvé contre le site réel
+par un vérificateur, pas par un test automatisé). **E1, E3, E4, E6, E7** restent
+dehors : Autohero, LaCentrale, `analyze_models` et la dédup inter-sources.
+228 tests, dont les corrected du lot de review ; trois reviews ont déclaré zéro
+P0/P1 confirmé, et les dernières corrections ont été revues à part.
+
 | # | Étape | Preuve (dans Docker) |
 |---|---|---|
 | **E0** | Squelette : git, image, entrypoint, serveur MCP stdio qui répond à `list_brands([])` | un client MCP de test (`mcp` python) appelle `list_brands` et reçoit un JSON valide ; **stdout ne contient que du JSON-RPC** (test : zéro octet non-JSON) |
