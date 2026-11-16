@@ -376,7 +376,9 @@ def test_harvest_returns_a_job_its_coverage_and_an_entry_cursor(tmp_path):
     assert row["announced_total"] == 3
     assert row["truncated"] is False
     entry = decode(result["cursor"])
-    assert (entry.job_id, entry.offset, entry.sort) == (result["job_id"], 0, "price_asc")
+    # Le tri du curseur est celui du contrat : `age_desc` par défaut, pas le
+    # prix croissant qui sert les annonces à 1 € en premier chez AutoScout24.
+    assert (entry.job_id, entry.offset, entry.sort) == (result["job_id"], 0, "age_desc")
 
 
 def test_harvest_stops_when_the_site_runs_out_of_pages(tmp_path):

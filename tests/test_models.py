@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_car_compare.models import Page
+from mcp_car_compare.models import Criteria, Page, price_is_plausible
 
 
 def test_rendered_vaut_par_defaut_ce_que_la_page_porte():
@@ -45,3 +45,30 @@ def test_un_rendered_inferieur_a_ce_que_la_page_porte_est_refuse():
     # que deux docstrings présentent comme un contrat. Mieux vaut refuser ici.
     with pytest.raises(ValueError, match="sous-déclare"):
         Page(listings=[object(), object()], rendered=1)
+
+
+# --- prix crédible -------------------------------------------------------------
+
+def test_un_prix_a_un_euro_n_est_pas_un_prix():
+    # AutoScout24 publie des annonces à 1 € pour dire « prix non communiqué »
+    # (mesuré le 2026-11-16 : `priceRaw: 1`, `priceFormatted: "€ 1"`). Ce n'est
+    # pas une erreur de parsing, c'est le site — mais ce n'est pas un prix.
+    assert price_is_plausible(1) is False
+    assert price_is_plausible(0) is False
+    assert price_is_plausible(-500) is False
+    assert price_is_plausible(None) is False
+
+
+def test_le_seuil_de_credibilite_est_100_euros():
+    # 99 et 100 sont écrits en dur À DESSEIN : citer `PRICE_FLOOR_EUR` ici
+    # rendrait le test tautologique, puisque changer le seuil changerait
+    # l'attendu avec lui.
+    assert price_is_plausible(99) is False
+    assert price_is_plausible(100) is True
+    assert price_is_plausible(23000) is True
+
+
+def test_le_tri_par_defaut_ne_sert_pas_la_boue_en_premier():
+    # `price_asc` chez AutoScout24 commence par les annonces à 1 €, mesuré sur
+    # la page réelle : le défaut ne doit donc pas être le prix croissant.
+    assert Criteria().sort == "age_desc"

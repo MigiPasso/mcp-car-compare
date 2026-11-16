@@ -272,6 +272,8 @@ Décisions prises pendant le premier lot, après mesure :
 | Marqueur de défi anti-bot | cherché **seulement** sur un statut ≠ 200 ou en l'absence de `__NEXT_DATA__` : une annonce peut citer la chaîne dans sa description sans que la page soit un défi |
 | Source hors périmètre dans `criteria.sources` | **refusée au parsage**, en nommant la source et celles servies. Un `status:"error"` se lirait « cette source a échoué », ce qui est faux : elle n'est pas implémentée |
 | `list_brands.models` | **retiré** de la charge : jamais rempli en production (301 marques, 0 modèle) |
+| Tri par défaut | **`age_desc`**, pas `price_asc` : mesuré le 16/11, AutoScout24 publie des annonces à **1 €** pour « prix non communiqué » (`priceRaw: 1`), et un tri par prix croissant commence donc par ces annonces-là. La première page d'un corpus sans critère était 100 % de la boue |
+| Prix crédible | plancher **100 €**, repris d'ICH (mesuré : 228 annonces sous 800 €, prix triés `10, 280, 299, 300, …` — un seul aberrant). La valeur stockée reste celle du site ; `offers` ajoute `price_plausible` pour que l'appelant n'ait pas à le deviner |
 
 ## 9. La décision qui reste ouverte
 

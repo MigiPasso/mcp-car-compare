@@ -37,7 +37,40 @@ FUELS = ("essence", "diesel", "electrique", "hybride", "")
 GEARS = ("auto", "manuelle", "")
 SELLERS = ("pro", "particulier", "")
 SORTS = ("price_asc", "price_desc", "age_desc")
+# Le tri par défaut ne peut exister qu'ici. Il était recopié dans le parsage des
+# critères (`tools._parse_criteria`), et la copie gardait `price_asc` : changer
+# le défaut dans le contrat ne changeait donc rien à ce que le site recevait.
+# Mesuré : après correction du contrat, une récolte sans `sort` demandait
+# toujours le prix croissant et servait les annonces à 1 € en premier.
+DEFAULT_SORT = "age_desc"
 SOURCE_STATUSES = ("ok", "challenge", "error", "capped")
+
+# Plancher de crédibilité d'un prix affiché, en euros. Mesuré, pas deviné —
+# repris de l'outil précédent : campagne du 2026-11-12, 228 annonces sous 800 €,
+# prix relevés triés `10, 280, 299, 300, 390, 400, 499, 500, 500, 600, 650, 650,
+# 680, 700, 700, 790, 800`. Un seul aberrant, deux ordres de grandeur sous le
+# suivant (un Audi Q3 de 2022, 68 983 km, affiché à 10 €). À 100 € on n'écarte
+# que lui ; à 500 € — la tentation naturelle — on écarterait six des dix-sept
+# prix visibles sans aucune preuve qu'ils soient faux.
+#
+# Le seuil existe parce qu'AutoScout24 publie des annonces à **1 €** pour dire
+# « prix non communiqué » (`priceRaw: 1`, `priceFormatted: "€ 1"`, mesuré sur
+# la page de résultats le 2026-11-16). Ce ne sont pas des erreurs de parsing :
+# c'est le site qui l'envoie. La conséquence pratique est qu'un tri par prix
+# croissant commence par ces annonces-là.
+PRICE_FLOOR_EUR = 100
+
+
+def price_is_plausible(price: int | None) -> bool:
+    """Un prix affiché peut-il être celui d'une voiture ?
+
+    Un prix nul, négatif ou à 1 € n'en est pas un. Cette fonction est la règle
+    UNIQUE : un appelant qui recopie `price > 0` recrée le défaut qu'elle
+    corrige. Le test qui l'accompagne écrit 99 et 100 en dur, et il a raison de
+    le faire : citer `PRICE_FLOOR_EUR` rendrait le test tautologique, puisque
+    changer le seuil changerait l'attendu avec lui.
+    """
+    return price is not None and price >= PRICE_FLOOR_EUR
 
 # --- Bornes d'entrée ---------------------------------------------------------
 # Refusées au-delà, par une erreur qui nomme la borne. Sans elles, un appelant
@@ -182,7 +215,7 @@ class Criteria:
     markets: tuple[str, ...] = ("fr",)
     sources: tuple[str, ...] = ("autoscout24",)
     pages_max: int = 5
-    sort: str = "price_asc"
+    sort: str = DEFAULT_SORT
 
 
 @dataclass(slots=True)

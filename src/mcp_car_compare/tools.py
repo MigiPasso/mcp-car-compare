@@ -37,6 +37,8 @@ from .models import (
     MAX_BUDGET_S,
     MAX_PAGES,
     SERVED_SOURCES,
+    DEFAULT_SORT,
+    price_is_plausible,
     SOURCE_STATUSES,
     SOURCES,
     SORTS,
@@ -239,7 +241,10 @@ def register(
                     )
                 )
             return {
-                "items": [item.as_dict() for item in items],
+                "items": [
+                    {**item.as_dict(), "price_plausible": price_is_plausible(item.price)}
+                    for item in items
+                ],
                 "next_cursor": following,
                 "has_more": has_more,
                 "coverage": corpus.as_dict(),
@@ -603,7 +608,7 @@ def _parse_criteria(raw: dict, *, pages_max: int) -> Criteria:
     unknown = sorted(set(raw) - _CRITERIA_KEYS)
     if unknown:
         raise ValueError(f"critère(s) inconnu(s) : {', '.join(unknown)}")
-    sort = raw.get("sort", "price_asc")
+    sort = raw.get("sort", DEFAULT_SORT)
     if sort not in SORTS:
         raise ValueError(f"tri inconnu : {sort!r} (attendu : {', '.join(SORTS)})")
     fuel = raw.get("fuel", "")
