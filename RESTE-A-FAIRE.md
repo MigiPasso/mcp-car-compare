@@ -59,6 +59,14 @@ b. L'avertissement cite le jeton (`relance avec resume="…" pour élargir`),
 c. Le side-car accepte `start_page` : LaCentrale reprend à sa page sans relire
    (ni repayer) les précédentes.
 
+**Plafond de pages par source, pas global — à corriger.** `MAX_PAGES = 20`
+vient d'AutoScout24 (qui rend une page vide au-delà) et s'applique aujourd'hui à
+toutes les sources. Mesuré le 2026-11-28 : une recherche Yaris hybride annonce
+524 annonces sur LaCentrale (~22 pages), la reprise s'est arrêtée à **441/524**
+et `pages_max=21` a été refusé avec le message « plafond mesuré du site » — faux
+pour LaCentrale. Deux corrections : un plafond par source (`Site.MaxPages`), et
+un message qui nomme la source dont il parle.
+
 **Contrainte de pas, mesurée après coup** : une reprise relance le navigateur
 (~20 s) puis lit ~8 s par page. `pages_max=2` puis `resume` avec `pages_max=6` a
 pris **68 s** — au-delà de 3-4 pages par reprise, l'appel approche le délai du
