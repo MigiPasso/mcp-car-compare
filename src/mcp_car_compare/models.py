@@ -78,13 +78,16 @@ def price_is_plausible(price: int | None) -> bool:
     return price is not None and price >= PRICE_FLOOR_EUR
 
 
-# Nombre de prix crédibles sous lequel une analyse de modèle s'abstient : sous
-# ce seuil, une médiane décrit trois annonces et se lit comme un prix de
-# marché. Repris d'ICH, et écrit ici UNE fois — `tools` le lit, il ne le
-# recopie pas. Un groupe qui n'atteint pas le seuil apparaît quand même, avec
-# des quantiles nuls et un avertissement qui cite son compte : cacher le groupe
-# ferait disparaître des annonces du corpus, et une estimation inventée serait
-# pire que les deux.
+# Nombre d'annonces comparables — une même voiture comptée une fois — sous
+# lequel les deux lecteurs s'abstiennent : `offers` pour un écart au marché
+# (`market_n`), `analyze_models` pour une médiane de groupe (`n_distinct`).
+# C'est l'effectif de la SÉRIE réellement utilisée qui est jugé, jamais le
+# nombre d'annonces : sous ce seuil, une médiane décrit trois voitures et se lit
+# comme un prix de marché. Repris d'ICH, et écrit ici UNE fois — `tools` le lit,
+# il ne le recopie pas. Un groupe qui n'atteint pas le seuil apparaît quand
+# même, avec des quantiles nuls et un avertissement qui cite son compte :
+# cacher le groupe ferait disparaître des annonces du corpus, et une estimation
+# inventée serait pire que les deux.
 MIN_COMPARABLES = 6
 
 

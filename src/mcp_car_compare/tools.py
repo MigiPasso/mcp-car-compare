@@ -308,6 +308,9 @@ def register(
         pèserait double. Ce n'est pas « des voitures distinctes » — deux
         voitures réellement distinctes qui partagent modèle, année, kilométrage
         et prix se rabattent sur une, faute de donnée qui les sépare.
+        `analyze_models` compte la même chose par groupe sous `n_distinct`, avec
+        la même clé : les deux outils ne peuvent donc pas donner deux chiffres
+        pour la même idée.
 
         Deux moitiés indépendantes, et c'est voulu : `market_median` et
         `market_n` décrivent LE MARCHÉ et existent que l'annonce soit chiffrable
@@ -436,11 +439,27 @@ def register(
         reste une annonce. `n` compte toutes les annonces du groupe, `n_priced`
         celles qui portent un prix crédible, et l'écart est visible.
 
-        **Sous six prix crédibles, l'outil s'abstient**
+        **`n_distinct` compte les annonces comparables à prix crédible, une même
+        voiture comptée une fois** (`store._duplicate_key`, la clé qu'`offers`
+        applique déjà à `market_n` et à `duplicate_of`) : c'est la longueur
+        exacte de la série qui porte les quantiles, d'où
+        `n_distinct <= n_priced <= n`. Ce n'est pas « des voitures distinctes » —
+        deux voitures réellement distinctes qui partagent modèle, année,
+        kilométrage et prix se rabattent sur une, faute de donnée qui les
+        sépare. Sans ce champ, un corpus où une voiture est annoncée deux fois
+        donnait deux chiffres pour la même idée selon l'outil : `offers`
+        dédoublonnait sa cohorte, l'analyse non, et la médiane portait sur un
+        corpus où un doublon pesait double.
+
+        **Sous six voitures distinctes, l'outil s'abstient**
         (`models.MIN_COMPARABLES`) : le groupe apparaît quand même, avec
         `price_median`, `price_p25` et `price_p75` à `null`, et un `warning` qui
-        cite son nombre de comparables. Jamais d'estimation, jamais un groupe
-        caché.
+        cite ce nombre-là — « N voiture(s) distincte(s) », où N est `n_distinct`,
+        donc les annonces comparables dont une même voiture ne compte qu'une
+        fois, jamais `n`. Le seuil porte sur la série réellement utilisée, et
+        non sur le nombre d'annonces : compter les annonces ferait décider d'une
+        médiane par un doublon, et ce doublon pèserait ensuite dans la médiane
+        qu'il a autorisée. Jamais d'estimation, jamais un groupe caché.
 
         **Quantiles par interpolation linéaire** sur la série triée, au rang
         `(n - 1) * q` : pour huit prix triés, `p25` est au rang 1,75 —
@@ -488,10 +507,15 @@ def register(
             )
         for group in groups:
             prices = series[(group.make_key, group.group_key)]
+            # Le compte des voitures distinctes EST la longueur de la série :
+            # deux chiffres pour une seule liste pourraient diverger, un seul
+            # ne le peut pas. C'est aussi l'effectif que le seuil doit juger,
+            # puisque c'est sur cette liste que porte la médiane.
+            n_distinct = len(prices)
             median = quartile_low = quartile_high = None
-            if group.n_priced < MIN_COMPARABLES:
+            if n_distinct < MIN_COMPARABLES:
                 warnings.append(
-                    f"{group.group_label} : {group.n_priced} prix crédible(s) "
+                    f"{group.group_label} : {n_distinct} voiture(s) distincte(s) "
                     f"(< {MIN_COMPARABLES}) — aucune médiane"
                 )
             else:
@@ -505,6 +529,7 @@ def register(
                     "group_label": group.group_label,
                     "n": group.n,
                     "n_priced": group.n_priced,
+                    "n_distinct": n_distinct,
                     "price_median": median,
                     "price_p25": quartile_low,
                     "price_p75": quartile_high,

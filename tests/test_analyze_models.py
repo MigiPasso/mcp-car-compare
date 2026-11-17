@@ -116,10 +116,12 @@ def test_le_plancher_de_creditibilite_est_un_parametre_de_la_requete(tmp_path):
     assert (bas[0].n_priced, haut[0].n_priced) == (6, 3)
 
 
-def test_n_priced_est_exactement_la_longueur_de_la_serie_rendue(tmp_path):
-    # Deux chiffres qui doivent dire la même chose : le compte agrégé en SQL et
-    # la série sur laquelle les quantiles sont calculés. S'ils divergent, une
-    # médiane peut etre calculée sur six prix et annoncée pour cinq.
+def test_n_distinct_compte_la_serie_des_prix_credibles_pas_toutes_les_annonces(tmp_path):
+    # Le compte des voitures distinctes porte sur la SÉRIE qui sert aux
+    # quantiles, donc sur les seuls prix crédibles : une annonce à 1 € et une
+    # annonce sans prix restent dans `n`, jamais dans `n_distinct`. Compter
+    # toutes les annonces donnerait 5 ici, et le seuil jugerait alors une série
+    # qui n'est pas celle de la médiane.
     seed(tmp_path, prices_to_cars([1, 9_000, 10_000, None, 12_000]))
     with Store(tmp_path / "corpus.db") as store:
         groups, _ = store.model_groups(ListingFilter(), price_floor=PRICE_FLOOR_EUR, limit=30)
@@ -128,12 +130,12 @@ def test_n_priced_est_exactement_la_longueur_de_la_serie_rendue(tmp_path):
             [(group.make_key, group.group_key) for group in groups],
             price_floor=PRICE_FLOOR_EUR,
         )
-    # La jointure passe par la CLÉ normalisée, celle que `model_groups` a groupée
-    # et que `group_prices` reçoit : deux chiffres qui doivent dire la même chose.
-    assert [
-        (group.n, group.n_priced, len(series[(group.make_key, group.group_key)]))
-        for group in groups
-    ] == [(5, 3, 3)]
+        (group,) = groups
+        # La jointure passe par la CLÉ normalisée, celle que `model_groups` a
+        # groupée et que `group_prices` reçoit.
+        assert len(series[(group.make_key, group.group_key)]) == 3
+    (rendered,) = analyze(tmp_path)["groups"]
+    assert (rendered["n"], rendered["n_priced"], rendered["n_distinct"]) == (5, 3, 3)
 
 
 # --- D4 : abstention sous six comparables --------------------------------------
@@ -163,6 +165,116 @@ def test_cinq_prix_credibles_s_abstiennent_et_six_rendent_une_mediane(tmp_path):
         "Clio" in warning and "5" in warning and "aucune médiane" in warning
         for warning in result["warnings"]
     )
+
+
+# --- lot B : une même voiture ne compte qu'une fois ----------------------------
+
+
+def test_deux_annonces_de_la_meme_voiture_ne_pesent_qu_une_fois_dans_la_serie(tmp_path):
+    # Lot B : `offers` dédoublonnait déjà sa cohorte (`market_n`), l'analyse
+    # comptait toutes les annonces — deux chiffres pour la même idée, et une
+    # médiane où un doublon pesait double.
+    #
+    # Six annonces, dont deux qui décrivent la MÊME voiture (même année, même
+    # kilométrage, même prix : la clé de `store._duplicate_key`). Série des prix
+    # crédibles triée des cinq voitures : [10 000, 12 000, 14 000, 16 000,
+    # 18 000], donc p25 au rang (5-1) * 0,25 = 1 → 12 000, médiane au rang 2 →
+    # 14 000, p75 au rang 3 → 16 000. Sur les six ANNONCES, la médiane serait
+    # (12 000 + 14 000) / 2 = 13 000 — la différence est ce que le lot corrige.
+    #
+    # Les quantiles se vérifient sur la SÉRIE rendue, pas sur la sortie de
+    # l'outil : `n_distinct` vaut 5, donc sous le seuil de 6, et l'outil
+    # s'abstient — c'est la règle du lot, et le test suivant la prouve sur un
+    # groupe à six voitures.
+    seed(
+        tmp_path,
+        [
+            car("d1", price=10_000, year=2021, km=48_000),
+            car("d2", price=10_000, year=2021, km=48_000),  # la même voiture
+            car("c1", price=12_000, year=2020, km=30_000),
+            car("c2", price=14_000, year=2019, km=60_000),
+            car("c3", price=16_000, year=2022, km=20_000),
+            car("c4", price=18_000, year=2018, km=90_000),
+        ],
+    )
+    (group,) = analyze(tmp_path)["groups"]
+    # Trois chiffres distincts, et c'est voulu : `n` compte les ANNONCES,
+    # `n_priced` celles qui portent un prix crédible, `n_distinct` les annonces
+    # comparables une même voiture comptée une fois.
+    assert (group["n"], group["n_priced"], group["n_distinct"]) == (6, 6, 5)
+    with Store(tmp_path / "corpus.db") as store:
+        series = store.group_prices(
+            ListingFilter(), [("renault", "clio")], price_floor=PRICE_FLOOR_EUR
+        )
+    prices = series[("renault", "clio")]
+    # La série a perdu le doublon : cinq prix, pas six.
+    assert prices == [10_000, 12_000, 14_000, 16_000, 18_000]
+    assert (
+        tools._quantile(prices, 0.25),
+        tools._quantile(prices, 0.5),
+        tools._quantile(prices, 0.75),
+    ) == (12_000, 14_000, 16_000)
+    # La même médiane sur les six annonces vaudrait 13 000 : ce que le test
+    # refuse explicitement, pour que la différence soit écrite quelque part.
+    assert tools._quantile([10_000, 10_000, 12_000, 14_000, 16_000, 18_000], 0.5) == 13_000
+
+
+def test_l_abstention_porte_sur_les_voitures_distinctes_pas_sur_les_annonces(tmp_path):
+    # Le seuil est lu dans models.MIN_COMPARABLES (6) : deux groupes qui le
+    # passeraient si le compte était celui des annonces (`n` ou `n_priced`).
+    #   - Clio : 6 annonces, dont deux identiques → n_distinct = 5 → abstention,
+    #     et le warning cite 5, le chiffre qui a décidé ;
+    #   - Série 3 : 7 annonces, dont deux identiques → n_distinct = 6 → médiane,
+    #     calculée sur les six voitures : (24 000 + 26 000) / 2 = 25 000. Sur
+    #     les sept annonces ce serait 24 000 — un doublon pèserait donc dans la
+    #     médiane qu'il vient d'autoriser.
+    # Juger `group.n` (ou `group.n_priced`) rendrait une médiane aux deux et
+    # 24 000 à la seconde : c'est ce que ce test refuse.
+    clio = [
+        car("d1", price=10_000, year=2021, km=48_000),
+        car("d2", price=10_000, year=2021, km=48_000),  # la même voiture
+        car("c1", price=12_000, year=2020, km=30_000),
+        car("c2", price=14_000, year=2019, km=60_000),
+        car("c3", price=16_000, year=2022, km=20_000),
+        car("c4", price=18_000, year=2018, km=90_000),
+    ]
+    # `prefix` compte : les deux 24 000 sont deux `source_id` de la même voiture.
+    serie = prices_to_cars(
+        [20_000, 22_000, 24_000, 24_000, 26_000, 28_000, 30_000],
+        prefix="m",
+        make="BMW",
+        group="serie 3",
+        label="Série 3",
+    )
+    seed(tmp_path, clio + serie)
+    result = analyze(tmp_path)
+    by_group = {group["group"]: group for group in result["groups"]}
+    abstenu, chiffre = by_group["clio"], by_group["serie 3"]
+    assert (abstenu["n"], abstenu["n_priced"], abstenu["n_distinct"]) == (6, 6, 5)
+    assert (abstenu["price_median"], abstenu["price_p25"], abstenu["price_p75"]) == (
+        None,
+        None,
+        None,
+    )
+    assert any(
+        "Clio" in warning
+        and "5 voiture(s) distincte(s)" in warning
+        and "aucune médiane" in warning
+        for warning in result["warnings"]
+    )
+    assert (chiffre["n"], chiffre["n_priced"], chiffre["n_distinct"]) == (7, 7, 6)
+    assert chiffre["price_median"] == 25_000  # rang 2,5 sur les six voitures
+
+
+def test_sans_doublon_n_distinct_egale_n(tmp_path):
+    # Le champ ne doit pas inventer un écart : sur un corpus où chaque annonce
+    # est une voiture, les trois comptes coïncident. Une clé de doublon trop
+    # large les ferait diverger ici — sans le prix dans la clé, ces six prix
+    # différents se rabattraient sur une seule voiture — et c'est ce que ce test
+    # refuse.
+    seed(tmp_path, prices_to_cars([10_000, 11_000, 12_000, 13_000, 14_000, 15_000]))
+    (group,) = analyze(tmp_path)["groups"]
+    assert (group["n"], group["n_priced"], group["n_distinct"]) == (6, 6, 6)
 
 
 # --- D5 : quantiles par interpolation linéaire ---------------------------------

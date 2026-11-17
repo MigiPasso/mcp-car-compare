@@ -266,6 +266,13 @@ class ModelGroup:
     crédible, et c'est cette série-là, seule, qui porte les quantiles de prix.
     L'écart entre les deux chiffres est donc visible sans avoir à le recalculer.
 
+    Le nombre d'annonces comparables de cette série — une même voiture comptée
+    une fois, la clé de `_duplicate_key` — n'est délibérément PAS un champ ici :
+    c'est la longueur de la série que rend `group_prices`, qui dédoublonne. Un
+    champ de plus serait une seconde définition du même chiffre, et deux
+    chiffres pour une seule série peuvent diverger ; `n_priced` reste donc un
+    compte d'ANNONCES, jamais un compte de voitures.
+
     `year_median` et `km_median` sont les médianes classiques — la moyenne des
     deux valeurs du milieu quand l'effectif est pair — calculées en SQL sur les
     annonces du groupe qui portent l'année, respectivement le kilométrage.
@@ -920,7 +927,8 @@ class Store:
         *,
         price_floor: int,
     ) -> dict[tuple[str, str], list[int]]:
-        """Les prix crédibles de chaque groupe demandé, triés croissant.
+        """Les prix crédibles de chaque groupe demandé, triés croissant, une
+        même voiture comptée une seule fois.
 
         Une seule requête pour tous les groupes retenus, et pas une par groupe :
         chaque groupe coûterait une application du filtre. Les prix sous le
@@ -929,6 +937,21 @@ class Store:
         un prix. Un groupe sans prix crédible rend une liste vide, jamais une
         clé absente : l'appelant doit pouvoir distinguer « zéro prix » d'un
         groupe qu'il aurait oublié de demander.
+
+        **La série est dédoublonnée avec `_duplicate_key`**, la clé que `offers`
+        applique déjà à sa cohorte (`market_n`, `duplicate_of`) : une voiture
+        annoncée deux fois sous deux `source_id` n'entre qu'une fois, sinon elle
+        pèserait double dans la médiane du groupe — c'est le défaut que ce
+        dédoublonnage corrige, l'analyse comptant avant toutes les annonces là
+        où `offers` comptait une voiture une fois. La conséquence à connaître :
+        `len(série)` n'est PAS `n_priced`, qui compte des annonces.
+
+        Le dédoublonnage se fait en Python, par groupe, et pas en SQL :
+        `SELECT DISTINCT` tiendrait deux kilométrages inconnus pour égaux, ce que
+        la clé refuse (`NULL` n'est pas une valeur égale). Le SQL projette donc
+        les cinq pièces de la clé en plus du prix. Deux annonces de la même
+        voiture portent le même prix — le prix est DANS la clé — donc l'ordre
+        entre elles ne change pas le prix retenu.
         """
         series: dict[tuple[str, str], list[int]] = {group: [] for group in groups}
         if not groups:
@@ -944,6 +967,7 @@ class Store:
         extra = f" AND {clause}" if clause else ""
         rows = self._conn.execute(
             'SELECT unaccent(l."make") AS make_key, unaccent(l."group") AS grp_key, '
+            'l."market" AS market, l."year" AS year, l."km" AS km, '
             'l."price" AS price '
             f'FROM "listings" AS l WHERE ({keys}) AND l."price" >= ?{extra} '
             'ORDER BY make_key, grp_key, l."price"',
@@ -953,8 +977,29 @@ class Store:
                 *params,
             ),
         ).fetchall()
+        # Un ensemble de clés par groupe : deux groupes peuvent porter la même
+        # voiture au même prix, et ce sont deux séries distinctes.
+        seen: dict[tuple[str, str], set[tuple[str, str, str, int, int, int]]] = {
+            group: set() for group in groups
+        }
         for row in rows:
-            series[(row["make_key"], row["grp_key"])].append(row["price"])
+            group_key = (row["make_key"], row["grp_key"])
+            # `make_key` et `grp_key` sont déjà normalisés par le SQL ;
+            # `_duplicate_key` les normalise une seconde fois, sans effet
+            # (`unaccent` est idempotent).
+            duplicate = _duplicate_key(
+                row["market"],
+                row["make_key"],
+                row["grp_key"],
+                row["year"],
+                row["km"],
+                row["price"],
+            )
+            if duplicate is not None:
+                if duplicate in seen[group_key]:
+                    continue
+                seen[group_key].add(duplicate)
+            series[group_key].append(row["price"])
         return series
 
     def unmatched_filters(
