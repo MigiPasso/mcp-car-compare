@@ -59,6 +59,12 @@ b. L'avertissement cite le jeton (`relance avec resume="…" pour élargir`),
 c. Le side-car accepte `start_page` : LaCentrale reprend à sa page sans relire
    (ni repayer) les précédentes.
 
+**Contrainte de pas, mesurée après coup** : une reprise relance le navigateur
+(~20 s) puis lit ~8 s par page. `pages_max=2` puis `resume` avec `pages_max=6` a
+pris **68 s** — au-delà de 3-4 pages par reprise, l'appel approche le délai du
+client MCP (~60 s) et expire. Pour lire les 524 annonces LaCentrale d'une
+recherche : plusieurs reprises de 3 pages, jamais une de 20.
+
 ## Petits chantiers repérés mais non faits
 
 1. **`analyze_models` compte les doublons**, `offers.market_n` non : deux chiffres pour la même idée selon l'outil. À aligner (probablement dédupliquer côté analyse aussi).
