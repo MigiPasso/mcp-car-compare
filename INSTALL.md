@@ -2,7 +2,7 @@
 
 Deux voies. Dans les deux cas, la configuration client est la même.
 
-## 1. Depuis le dépôt (collaborateur)
+## 1. Depuis le dépôt
 
 ```sh
 git clone git@github.com:MigiPasso/mcp-car-compare.git
