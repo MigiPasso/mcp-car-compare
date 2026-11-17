@@ -65,14 +65,40 @@ le site s'arrêtant de lui-même par une page vide), `MAX_PAGES_ANY` pour la bor
 d'un appel multi-sources, et le message nomme les sources et leurs plafonds.
 `pages_max=21` est donc accepté pour LaCentrale et refusé pour AutoScout24.
 
-**Reste ouvert, mesuré** : reprendre au-delà de la page 20 sur LaCentrale
-**expire** (`pages_max=22` et `25` avec `resume`, budget 60-90 s, côté client,
-même après avoir recyclé le conteneur). 441 annonces sur 524 sont atteignables ;
-les 83 dernières ne le sont pas encore. Piste : la page 21 de LaCentrale ne rend
-peut-être pas de cartes (le site s'arrête avant), et le navigateur attend son
-timeout au lieu de le constater — à mesurer avec une sonde directe sur
-`/p-21.html`. Gain réel faible : la médiane sur 311 hybrides ne bouge pas
-(16 950 € contre 16 895 € sur 116).
+### Pourquoi une reprise au-delà de la page 20 expire — mesuré le 2026-11-28
+
+Sonde Camoufox directe sur `?page=N` (recherche Yaris hybride, 524 annoncées) :
+
+| page | annonces rendues | remarque |
+|---|---|---|
+| 21 | 24 | **aucune en commun avec la page 20** |
+| 22 | 23 | puis **0** au chargement suivant |
+| 23 | 19 | dernière page |
+| 24, 25, 30, 40 | **0** | fin réelle du stock |
+
+Trois faits, dans l'ordre d'importance :
+
+1. **Le site ne s'arrête pas à 20 pages** : il en a 23 pour cette recherche. Le
+   blocage n'était donc pas le plafond.
+2. **La page est INTERMITTENTE** : la page 22 a rendu 23 annonces une fois, 0 la
+   fois suivante. Or une page qui ne rend rien coûte **25 s d'attente** (mesuré :
+   25,2 s / 25,4 s / 25,4 s sur les pages 22, 24, 25). Demander 5 pages dont 2
+   vides = 50 s d'attente pure + ~20 s de lancement de navigateur → au-delà du
+   délai du client MCP (~60 s). **C'est la vraie cause des `Request timed out`**,
+   pas le plafond de pages.
+3. **Une page vide est aujourd'hui lue comme « fin du marché »**, et c'est faux
+   sur ce site : une page 22 vide alors que la 23 contient 19 annonces coupe la
+   récolte. Les **441 / 524** mesurés peuvent donc être sous-estimés, en plus de
+   l'effet du plafond.
+
+Ce qui reste à faire (aucun code touché) :
+
+- **réessayer une fois** une page qui rend zéro avant de conclure à la fin ;
+- **ne pas s'arrêter sur la première page vide** : sonder la suivante, et
+  n'arrêter qu'après deux vides consécutifs ;
+- garder `?page=N` (la forme `/listing/p-N.html` n'existe plus : erreur de
+  navigation, mesuré) ;
+- le plafond LaCentrale à 30 est cohérent avec 23 pages réelles.
 
 **Contrainte de pas, mesurée après coup** : une reprise relance le navigateur
 (~20 s) puis lit ~8 s par page. `pages_max=2` puis `resume` avec `pages_max=6` a
