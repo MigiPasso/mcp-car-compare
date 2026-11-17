@@ -684,7 +684,7 @@ class _Harvested:
     site n'annonçait plus rien, ou une page vide a montré que le stock est
     épuisé. C'est cette valeur — et elle seule — qui décide s'il y a un jeton de
     reprise à rendre : un jeton qui ne mènerait à aucune page serait la consigne
-    qui échoue que ce lot corrige (`RESTE-A-FAIRE.md` point 0).
+    qui échoue que ce lot corrige (`TODO.md`).
 
     Une source qui s'arrête sur le budget, sur une attente trop longue ou sur un
     échec de page laisse au contraire la page qu'elle n'a pas lue : c'est là

@@ -1,6 +1,6 @@
 """Le jeton de reprise d'une RÉCOLTE : une lecture profonde en appels courts.
 
-Mesuré le 2026-11-28 (`RESTE-A-FAIRE.md` point 0) :
+Mesuré le 2026-11-28 (`TODO.md`) :
 `harvest(sources=["lacentrale"], pages_max=20, budget_s=300)` puis
 `pages_max=10, budget_s=100` expiraient **tous les deux** côté client
 (`Request timed out`) sans rien écrire en base, et le seul jeton rendu était le
