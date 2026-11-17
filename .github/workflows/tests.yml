@@ -1,0 +1,31 @@
+name: tests
+
+# La suite tourne à chaque push et à chaque proposition de fusion. Une seule
+# commande, la même que le README : la CI exécute ce que la doc prescrit, pas une
+# variante. Les captures de pages de sites ne sont pas dans le dépôt, donc les
+# modules qui les rejouent sont sautés — c'est attendu, et la suite reste verte.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Suite de tests
+        run: |
+          docker run --rm \
+            -v "$PWD":/app -w /app \
+            -e PYTHONDONTWRITEBYTECODE=1 \
+            -e PYTHONPYCACHEPREFIX=/tmp/pyc \
+            python:3.12-slim \
+            sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider"
