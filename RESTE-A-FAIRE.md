@@ -15,19 +15,17 @@ Serveur MCP stdio, 4 outils, **377 tests**, image Docker 5 Go (navigateur inclus
 
 Branché dans `~/.pi/agent/mcp.json`.
 
-## En attente : Autohero (3ᵉ source)
+## Abandonné : Autohero (3ᵉ source)
 
-**La mesure est faite** — ne pas la refaire :
+**Décision de l'opérateur, 2026-11-28 : on ne la fait pas.** C'était la plus petite
+des trois sources, et la seule bloquée. Le code écrit pour elle a été perdu lors du
+nettoyage de l'historique (le stash a été emporté par le `gc`) — et personne ne le
+regrette.
 
-- `/fr/search/` : 12 annonces en HTML brut, **29 après chargement complet**, virtualisées (55 cartes montées pour 246 chargées).
-- Le défilement charge **24 annonces par cran**, jusqu'à **486 en 20 défilements** (46 s). Stock annoncé : 4 045.
-- **Aucune pagination par URL** : `page=`, `p=`, `start=`, `offset=` rendent la même page, en curl *et* dans le navigateur.
-- Compteur du site : `[data-qa-selector="filters-car-counter"]`.
-- Extraction qui marche : crochets `data-qa-selector` + défilement (le JSON-LD plafonne à 12 et ne porte ni année, ni km, ni carburant).
-
-**Le blocage** : à travers le side-car, `harvest` reçoit **401** sur `https://www.autohero.com/fr/search/?sort=published_at_desc`, alors qu'une sonde Camoufox isolée sur la même adresse rend 29 cartes. Le travail est dans `git stash` (`stash@{0}`, message « lot3 autohero ») — **non commité, non perdu**.
-
-Pistes, dans l'ordre : comparer en-têtes et cookies entre la sonde isolée et `sources/sidecar.py` ; vérifier si le side-car suit la redirection `&_abe=1` ; vérifier si le 401 vient de la navigation ou d'une requête déclenchée par l'extraction.
+La mesure reste là si un jour ça redevient utile : 12 annonces en HTML brut, **29
+après chargement complet**, **24 par défilement** jusqu'à **486** (46 s), aucune
+pagination par URL, et un **401** à travers le side-car alors qu'une sonde isolée
+rend ses cartes.
 
 ## Limites connues — pas des bugs
 
@@ -130,9 +128,6 @@ docker run --rm -v "$PWD":/app -w /app -e PYTHONDONTWRITEBYTECODE=1 \
 # reconstruire l'image et repartir propre
 docker build -t mcp-car-compare:latest .
 docker ps -q --filter ancestor=mcp-car-compare:latest | xargs -r docker rm -f
-
-# reprendre le travail Autohero
-git stash list && git stash pop
 
 # reprendre la session
 pi -c
