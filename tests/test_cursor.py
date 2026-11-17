@@ -14,6 +14,7 @@ from mcp_car_compare.cursor import (
     Cursor,
     CursorError,
     check,
+    criteria_fingerprint,
     decode,
     encode,
     hash_criteria,
@@ -143,3 +144,38 @@ def test_the_budget_changes_the_hash():
 
 def test_the_order_of_markets_does_not_change_the_hash():
     assert hash_criteria(Criteria(markets=("fr", "de")), 60) == hash_criteria(Criteria(markets=("de", "fr")), 60)
+
+
+# --- empreinte des critères seuls (jeton de reprise) --------------------------
+
+
+def test_l_empreinte_d_un_jeton_de_reprise_n_est_pas_celle_d_une_recolte():
+    # Deux empreintes, deux usages, et la différence est le budget : un jeton de
+    # reprise doit survivre à un changement de budget (c'est la ressource d'un
+    # appel, pas une propriété du job), là où le curseur d'`offers` ne le doit
+    # pas — deux budgets ne lisent pas le même nombre d'annonces. Mettre le
+    # budget dans l'empreinte du jeton rendrait `ResumeError` sur une reprise
+    # qui change de budget, donc refuserait le seul geste qu'un jeton sert à
+    # permettre.
+    criteres = Criteria(make="renault")
+    assert criteria_fingerprint(criteres) != hash_criteria(criteres, 60)
+
+
+def test_l_empreinte_des_criteres_seuls_ignore_la_profondeur_demandee():
+    # L'INVERSE de ce que ce test affirmait avant le 2026-11-28, et c'est le
+    # corriger, pas l'ajuster : `pages_max` est un plafond de LECTURE, pas un
+    # critère de recherche. Imposer qu'il soit identique rendait inutilisable
+    # tout jeton émis par une récolte coupée par son plafond — la reprise
+    # demandait forcément plus de pages, donc portait un autre plafond, donc
+    # était refusée. Mesuré : `pages_max=2` rendait un jeton que rien ne
+    # pouvait reprendre.
+    #
+    # Ce qui doit rester vrai : le plafond change ce que la récolte LIT, donc il
+    # reste dans l'identité de la récolte (`hash_criteria`).
+    assert (
+        criteria_fingerprint(Criteria(make="renault", pages_max=10))
+        == criteria_fingerprint(Criteria(make="renault", pages_max=20))
+    )
+    assert hash_criteria(Criteria(make="renault", pages_max=10), 60) != hash_criteria(
+        Criteria(make="renault", pages_max=20), 60
+    )

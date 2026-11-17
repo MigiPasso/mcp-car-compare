@@ -57,7 +57,7 @@ def client() -> TestClient:
 
 
 def test_la_route_rend_la_forme_annoncee(client, monkeypatch):
-    async def fake_scrape(url: str, max_pages: int) -> dict:
+    async def fake_scrape(url: str, max_pages: int, *, start_page: int = 1) -> dict:
         assert url == LISTING
         assert max_pages == 2
         return {
@@ -83,7 +83,7 @@ def test_la_route_rend_la_forme_annoncee(client, monkeypatch):
 
 
 def test_un_defi_rend_409_et_jamais_un_200_vide(client, monkeypatch):
-    async def challenged(url: str, max_pages: int) -> dict:
+    async def challenged(url: str, max_pages: int, *, start_page: int = 1) -> dict:
         raise sidecar.Challenge("défi anti-robot sur la page 1")
 
     monkeypatch.setattr(sidecar, "scrape_pages", challenged)
@@ -95,7 +95,7 @@ def test_un_defi_rend_409_et_jamais_un_200_vide(client, monkeypatch):
 
 
 def test_une_page_illisible_rend_502_avec_un_message(client, monkeypatch):
-    async def broken(url: str, max_pages: int) -> dict:
+    async def broken(url: str, max_pages: int, *, start_page: int = 1) -> dict:
         raise sidecar.ScrapeFailed("la page 1 n'a rendu aucune carte")
 
     monkeypatch.setattr(sidecar, "scrape_pages", broken)
@@ -107,7 +107,7 @@ def test_une_page_illisible_rend_502_avec_un_message(client, monkeypatch):
 
 
 def test_une_panne_du_navigateur_rend_502_avec_le_nom_de_l_erreur(client, monkeypatch):
-    async def crashed(url: str, max_pages: int) -> dict:
+    async def crashed(url: str, max_pages: int, *, start_page: int = 1) -> dict:
         raise RuntimeError("Target crashed")
 
     monkeypatch.setattr(sidecar, "scrape_pages", crashed)
@@ -121,7 +121,7 @@ def test_une_panne_du_navigateur_rend_502_avec_le_nom_de_l_erreur(client, monkey
 def test_une_url_d_un_autre_hote_est_refusee_sans_aucune_requete(client, monkeypatch):
     calls: list[tuple[str, int]] = []
 
-    async def fake_scrape(url: str, max_pages: int) -> dict:
+    async def fake_scrape(url: str, max_pages: int, *, start_page: int = 1) -> dict:
         calls.append((url, max_pages))
         return {"vehicles": [dict(VEHICLE)], "announced_total": None,
                 "pages_read": 1, "partial": False}
@@ -144,7 +144,7 @@ def test_un_corps_qui_n_est_pas_du_json_est_refuse_avant_la_route(client, monkey
     # refuse, pour qu'un 422 ne se lise pas comme un bug de la route.
     calls: list[tuple[str, int]] = []
 
-    async def fake_scrape(url: str, max_pages: int) -> dict:
+    async def fake_scrape(url: str, max_pages: int, *, start_page: int = 1) -> dict:
         calls.append((url, max_pages))
         return {"vehicles": [dict(VEHICLE)], "announced_total": None,
                 "pages_read": 1, "partial": False}
@@ -165,7 +165,7 @@ def test_un_navigateur_qui_ne_rend_pas_la_main_rend_502(client, monkeypatch):
 
     monkeypatch.setattr(sidecar, "REQUEST_TIMEOUT_S", 0.05)
 
-    async def hangs(url: str, max_pages: int) -> dict:
+    async def hangs(url: str, max_pages: int, *, start_page: int = 1) -> dict:
         await asyncio.sleep(10)
         return {}
 
@@ -175,6 +175,61 @@ def test_un_navigateur_qui_ne_rend_pas_la_main_rend_502(client, monkeypatch):
 
     assert response.status_code == 502
     assert "délai" in response.json()["error"]
+
+
+def test_la_page_de_depart_traverse_jusqu_au_scrape(client, monkeypatch):
+    # Le side-car accepte `start_page` : c'est ce qui permet à une reprise de
+    # récolte de repartir à la page suivante sans relire (ni repayer) celles
+    # déjà lues.
+    calls: list[tuple[str, int, int]] = []
+
+    async def fake_scrape(url: str, max_pages: int, *, start_page: int = 1) -> dict:
+        calls.append((url, max_pages, start_page))
+        return {"vehicles": [dict(VEHICLE)], "announced_total": None,
+                "pages_read": 5, "partial": True}
+
+    monkeypatch.setattr(sidecar, "scrape_pages", fake_scrape)
+
+    response = client.post("/scrape", json={"url": LISTING, "max_pages": 3,
+                                            "start_page": 5})
+
+    assert response.status_code == 200
+    assert calls == [(LISTING, 3, 5)]
+
+
+def test_une_page_de_depart_absente_vaut_le_debut(client, monkeypatch):
+    calls: list[int] = []
+
+    async def fake_scrape(url: str, max_pages: int, *, start_page: int = 1) -> dict:
+        calls.append(start_page)
+        return {"vehicles": [dict(VEHICLE)], "announced_total": None,
+                "pages_read": 1, "partial": False}
+
+    monkeypatch.setattr(sidecar, "scrape_pages", fake_scrape)
+
+    client.post("/scrape", json={"url": LISTING, "max_pages": 1})
+
+    assert calls == [1]
+
+
+def test_un_resultat_vide_est_refuse_au_debut_et_accepte_en_reprise(client, monkeypatch):
+    # Un 200 vide au début serait le mensonge que ce side-car existe pour
+    # empêcher (un marché désert au lieu d'une page illisible). À partir d'une
+    # page de reprise, c'est la réponse honnête d'un stock épuisé avant cette
+    # page : la refuser rendrait toute reprise au-delà du stock impossible.
+    async def empty(url: str, max_pages: int, *, start_page: int = 1) -> dict:
+        return {"vehicles": [], "announced_total": 40, "pages_read": 0, "partial": True}
+
+    monkeypatch.setattr(sidecar, "scrape_pages", empty)
+
+    debut = client.post("/scrape", json={"url": LISTING, "max_pages": 1})
+    reprise = client.post("/scrape", json={"url": LISTING, "max_pages": 1,
+                                          "start_page": 4})
+
+    assert debut.status_code == 502
+    assert "aucune annonce lue" in debut.json()["error"]
+    assert reprise.status_code == 200
+    assert reprise.json()["vehicles"] == []
 
 
 def test_le_health_repond_avant_tout_lancement_de_navigateur(client):

@@ -393,7 +393,9 @@ def test_harvest_returns_a_job_its_coverage_and_an_entry_cursor(tmp_path):
     source = FakeSource([Page(listings=[listing(index) for index in range(3)], announced_total=3)])
     mcp = install(tmp_path, source)
     result = harvest(mcp, {"pages_max": 2})
-    assert set(result) == {"job_id", "coverage", "cursor", "warnings"}
+    assert set(result) == {"job_id", "coverage", "cursor", "warnings", "resumes"}
+    # Tout a été lu : aucune source n'a de jeton de reprise à rendre.
+    assert result["resumes"] == []
     assert len(result["coverage"]) == 1
     row = result["coverage"][0]
     assert set(row) == {
@@ -559,7 +561,7 @@ def test_the_budget_is_per_source_not_global(tmp_path):
                 clock=clock,
             )
         )
-    assert [(row.source, row.read, row.status) for row in coverage] == [
+    assert [(item.coverage.source, item.coverage.read, item.coverage.status) for item in coverage] == [
         ("autoscout24", 40, "capped"),
         ("autohero", 40, "capped"),
     ]
@@ -971,16 +973,30 @@ def test_the_corpus_path_comes_from_the_configuration_when_not_passed(tmp_path, 
     assert len(mcp.tools["offers"](result["job_id"], None, 25)["items"]) == 1
 
 
-def test_une_recolte_tronquee_previent_avec_le_levier(tmp_path):
+def test_une_recolte_tronquee_previent_avec_le_jeton_de_reprise(tmp_path):
     # Le propriétaire l'a demandé explicitement : si la source annonce plus
     # d'annonces qu'on n'en a lu, l'appelant doit être prévenu — sinon il croit
-    # avoir tout le marché — et le message doit dire QUEL réglage tourner.
-    source = FakeSource([Page(listings=[listing(index) for index in range(20)], announced_total=500)])
-    mcp = install(tmp_path, source)
-    result = harvest(mcp, {"pages_max": 2})
+    # avoir tout le marché — et le message doit dire QUEL levier tourner.
+    #
+    # Mesuré le 2026-11-28 : « relance avec pages_max=20 » conseillait un appel
+    # qui expirait côté client (`Request timed out`) sans rien écrire en base.
+    # Le levier est donc le jeton de reprise, et `pages_max=20` ne doit plus
+    # apparaître — c'est l'action qui échoue que ce lot corrige.
+    clock = FakeClock()
+    source = FakeSource(
+        [
+            Page(listings=[listing(index) for index in range(20)], announced_total=500),
+            Page(listings=[listing(index) for index in range(20, 40)], announced_total=500),
+        ]
+    )
+    source.on_search = lambda _criteria, _page: clock.advance(40)  # 40 s par page
+    mcp = install(tmp_path, source, clock=clock)
+    result = harvest(mcp, {"pages_max": 5}, 60)
     (warning,) = result["warnings"]
-    assert "autoscout24" in warning and "20 annonce(s) lue(s) sur 500" in warning
-    assert "pages_max=20" in warning
+    (reprise,) = result["resumes"]
+    assert "autoscout24" in warning and "40 annonce(s) lue(s) sur 500" in warning
+    assert f'resume="{reprise["token"]}"' in warning
+    assert "pages_max=20" not in warning
 
 
 def test_une_recolte_complete_ne_previent_de_rien(tmp_path):

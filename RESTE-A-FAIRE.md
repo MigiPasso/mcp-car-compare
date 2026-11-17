@@ -9,7 +9,7 @@ Serveur MCP stdio, 4 outils, **377 tests**, image Docker 5 Go (navigateur inclus
 | Outil | Ce qu'il fait |
 |---|---|
 | `list_brands(source, market)` | marques du site (~0,5 s, un GET) |
-| `harvest(criteria, budget_s)` | récolte AutoScout24 + LaCentrale, 10 pages par défaut, plafond 20 |
+| `harvest(criteria, budget_s, resume)` | récolte AutoScout24 + LaCentrale, 10 pages par défaut, plafond 20 ; **reprenable** par jeton |
 | `offers(job_id, cursor, limit)` | pages de 25, avec écart au marché et doublons marqués |
 | `analyze_models(criteria, limit)` | médiane / quartiles / effectifs par modèle |
 
@@ -37,24 +37,29 @@ Pistes, dans l'ordre : comparer en-têtes et cookies entre la sonde isolée et `
 - **Les deux sites nomment les gammes différemment** (`500/595/695` contre `500`) : deux lignes, jamais fusionnées — l'outil ne devine pas qu'elles désignent la même voiture.
 - **Pas de veille de prix, pas de contournement de captcha, pas de calcul de frais.** Décidé, pas oublié.
 
-## Petits chantiers repérés mais non faits
+## Fait : une récolte profonde se découpe en appels courts
 
-0. **PRIORITÉ : une récolte profonde est impossible, et l'avertissement le conseille quand même.**
-   Mesuré le 2026-11-28 : `harvest(sources=["lacentrale"], pages_max=20, budget_s=300)`
-   puis `pages_max=10, budget_s=100` ont **tous les deux expiré côté client** (`Request
-   timed out`), sans rien écrire en base — le vérificateur avait été écrit pour
-   des appels courts. Or le message de couverture dit « relance avec
-   `pages_max=20` pour élargir » : il conseille une action qui échoue. Deux
-   corrections, ensemble :
-   a. **Une récolte reprenable** : le `cursor` rendu par `harvest` est celui d'`offers`
-      (il ne reprend pas la récolte). Il faut un jeton de reprise propre à `harvest`
-      (source déjà commencée, page suivante, `job_id`), pour découper une lecture
-      profonde en plusieurs appels courts.
-   b. **Un avertissement qui tienne sa promesse** : tant que (a) n'existe pas, le
-      message doit annoncer la profondeur réellement atteignable au lieu de
-      conseiller 20 pages. Une consigne qui échoue est pire que pas de consigne.
-   Piste de repli immédiate : ~10 pages sur AutoScout24 (rapide, ~5 s) sont
-   atteignables ; c'est LaCentrale (navigateur, ~8 s/page) qui dépasse le délai.
+Le défaut mesuré (2026-11-28) : `harvest(sources=["lacentrale"], pages_max=20,
+budget_s=300)` puis `pages_max=10, budget_s=100` expiraient **tous les deux**
+côté client (`Request timed out`) sans rien écrire en base, et le seul jeton
+rendu était le `cursor` d'`offers` — qui pagine des annonces déjà lues et ne
+reprend pas la récolte. Le message de couverture conseillait en plus « relance
+avec `pages_max=20` », c'est-à-dire une action qui échoue.
+
+Corrigé :
+
+a. `harvest(criteria, budget_s, resume)` rend `resumes`, une liste de jetons
+   `{source, market, token}` (vide quand tout est lu). Un jeton porte UNE source
+   et la page suivante (`resume.py`), et `resume=<jeton>` reprend cette source
+   seule, dans le même `job_id` ; la couverture cumule alors le total depuis le
+   début du job.
+b. L'avertissement cite le jeton (`relance avec resume="…" pour élargir`),
+   jamais `pages_max=20`. Quand il n'y a plus de page à demander, il le dit au
+   lieu de proposer un levier qui ne lit rien de plus.
+c. Le side-car accepte `start_page` : LaCentrale reprend à sa page sans relire
+   (ni repayer) les précédentes.
+
+## Petits chantiers repérés mais non faits
 
 1. **`analyze_models` compte les doublons**, `offers.market_n` non : deux chiffres pour la même idée selon l'outil. À aligner (probablement dédupliquer côté analyse aussi).
 2. **`list_brands` rend 301 marques d'un coup** (~20 Ko) : lourd pour un contexte de modèle. Un filtre par préfixe ou une limite serait plus propre.

@@ -18,6 +18,13 @@ refuse en la nommant.
 `criteria_hash` porte tous les champs qui changent le résultat d'une récolte,
 `budget_s` compris : deux récoltes du même critère avec des budgets différents
 ne lisent pas le même nombre d'annonces.
+
+L'empreinte des critères SEULS (`criteria_fingerprint`) est une seconde forme,
+avec un autre usage : c'est celle que porte un jeton de reprise (`resume.py`),
+parce que le budget d'une reprise est celui de l'appel qui reprend et non une
+propriété du job (voir `resume.check`). Les deux formes partagent le même
+constructeur (`_canonical`), donc un champ ajouté au contrat entre dans les
+deux au lieu d'en oublier une.
 """
 
 from __future__ import annotations
@@ -110,11 +117,17 @@ def check(cursor: Cursor, *, job_id: str, sort: str, criteria_hash: str) -> None
         )
 
 
-def hash_criteria(criteria: Criteria, budget_s: int) -> str:
-    """Empreinte courte des champs qui changent le résultat d'une récolte.
+def _canonical(
+    criteria: Criteria, budget_s: int | None, *, with_pages_max: bool = True
+) -> str:
+    """Les champs qui changent le résultat d'une récolte, en une chaîne stable.
 
     `markets` et `sources` sont triés avant hachage : l'ordre de parcours ne
-    change pas le corpus, il ne doit donc pas changer l'empreinte.
+    change pas le corpus, il ne doit donc pas changer l'empreinte. `budget_s`
+    n'entre dans la charge que s'il est fourni, et `pages_max` que si
+    `with_pages_max` — c'est toute la différence entre `hash_criteria` (identité
+    d'une récolte) et `criteria_fingerprint` (identité d'une recherche), et elle
+    est dite là-bas.
     """
     payload = {
         "make": criteria.make,
@@ -128,9 +141,40 @@ def hash_criteria(criteria: Criteria, budget_s: int) -> str:
         "gear": criteria.gear,
         "markets": sorted(criteria.markets),
         "sources": sorted(criteria.sources),
-        "pages_max": criteria.pages_max,
         "sort": criteria.sort,
-        "budget_s": budget_s,
     }
+    if with_pages_max:
+        payload["pages_max"] = criteria.pages_max
+    if budget_s is not None:
+        payload["budget_s"] = budget_s
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def hash_criteria(criteria: Criteria, budget_s: int) -> str:
+    """Empreinte courte d'une RÉCOLTE : critères et budget de l'appel.
+
+    C'est l'identité que portent `runs.criteria_hash` et le curseur d'`offers` :
+    deux récoltes du même critère avec des budgets différents ne lisent pas le
+    même nombre d'annonces, elles ne sont donc pas la même récolte.
+    """
+    return _canonical(criteria, budget_s)
+
+
+def criteria_fingerprint(criteria: Criteria) -> str:
+    """Empreinte des critères SEULS, sans le budget.
+
+    C'est l'empreinte d'un jeton de reprise (`resume.py`) : elle identifie la
+    RECHERCHE — ce qu'on cherche — et non la récolte. Le budget ET le plafond de
+    pages sont ceux de l'appel qui reprend, décidés par l'appelant pour tenir
+    dans le délai de son client : les inclure ici rendrait un jeton refusé dès
+    que la reprise demande plus de pages, c'est-à-dire précisément le geste
+    qu'un jeton de reprise existe pour permettre. Mesuré le 2026-11-28 : un
+    harvest coupé par `pages_max=2` rendait un jeton inutilisable, puisque toute
+    reprise aurait porté un autre plafond.
+
+    Un job garde quand même son `hash_criteria` d'origine, budget compris : une
+    reprise n'écrit jamais une nouvelle identité de récolte, elle continue la
+    même.
+    """
+    return _canonical(criteria, None, with_pages_max=False)

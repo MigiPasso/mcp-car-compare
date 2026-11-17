@@ -380,6 +380,32 @@ def test_la_page_un_demande_tout_le_lot_et_la_page_deux_n_emet_aucune_requete():
     assert json.loads(request.content)["url"] == search_url(criteria)
 
 
+def test_une_reprise_demande_sa_page_de_depart_au_side_car():
+    # C'est le raccord du point 7 : sans `start_page`, une reprise relisait la
+    # page 1 — repayer les pages déjà payées (~8 s/page dans le navigateur) est
+    # exactement ce qui faisait expirer l'appel côté client. Le `pages_max`
+    # transmis est celui qui RESTE dans le job, pas celui de l'appel.
+    sidecar = Sidecar(payload([vehicle("LC-9")], announced_total=465))
+    criteria = Criteria(markets=("fr",), pages_max=7)
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(sidecar.handler)
+        ) as client:
+            source = Lacentrale(client)
+            resumed = await source.search(criteria, 5)
+            # Le lot a déjà été demandé : cet appel-ci ne redemande rien.
+            after = await source.search(criteria, 6)
+            return resumed, after
+
+    resumed, after = run(scenario())
+    assert len(sidecar.requests) == 1
+    body = json.loads(sidecar.requests[0].content)
+    assert body["start_page"] == 5
+    assert body["max_pages"] == 3  # pages 5, 6 et 7 : le plafond du job
+    assert resumed.rendered == 1 and after.rendered == 0
+
+
 # --- catalogue de marques ------------------------------------------------------
 
 

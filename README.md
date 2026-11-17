@@ -140,7 +140,7 @@ stdio : rien d'autre à configurer, aucun port, aucun jeton.
 | Outil | Arguments | Rend |
 |---|---|---|
 | `list_brands` | `source?` (`autoscout24`), `market?` (`fr` ou `de`) | `{source, market, brands: [{value, label}], error}` — un **GET réel** chez le site (~0,5 s), aucun `coverage` (aucune récolte) ; un site en échec rend `error` et `brands` vide, l'outil ne lève pas. `market` compte : les libellés sont rendus dans la langue du marché (`Série 3` en `.fr`, `3er` en `.de`), et c'est le libellé rendu ici que `harvest` attend. `models` **n'est pas rempli en v1** : la taxonomie ne porte les modèles d'une marque que sur une page déjà filtrée sur elle, donc la clé est absente plutôt que présente et toujours vide |
-| `harvest` | `criteria`, `budget_s`, `sources?` | `{job_id, coverage, cursor, warnings}` — une ligne de `coverage` par source, celle de **cette** récolte. `warnings` prévient quand la source annonce plus d'annonces qu'on n'en a lu, avec le réglage à tourner (`pages_max`, défaut 10, plafond 20) |
+| `harvest` | `criteria`, `budget_s`, `resume?` | `{job_id, coverage, cursor, warnings, resumes}` — une ligne de `coverage` par source, celle de **cette** récolte. `resumes` porte un **jeton de reprise** par source qui n'est pas allée au bout : `resume="<jeton>"` reprend cette source seule, à sa page suivante, dans le même `job_id` (une récolte profonde se découpe donc en appels courts). `warnings` prévient quand la source annonce plus d'annonces qu'on n'en a lu, et cite ce jeton — jamais un `pages_max` plus grand |
 | `offers` | `job_id`, `cursor?`, `limit` | `{items, next_cursor, has_more, coverage}` — le corpus, jamais la somme des récoltes |
 
 `criteria` suit le contrat figé de `src/mcp_car_compare/models.py` :
@@ -148,7 +148,7 @@ stdio : rien d'autre à configurer, aucun port, aucun jeton.
 `gear`, `markets`, `pages_max`, `sort`. Trois règles décidées dans PLAN.md §8 :
 
 - `budget_s` s'applique **par source** et gagne toujours sur `pages_max` ; la
-  source qui ne rentre pas rend `status: "capped"` avec un curseur de reprise,
+  source qui ne rentre pas rend `status: "capped"` avec un jeton de reprise,
   jamais une erreur silencieuse ni un `read` inventé.
 - Changer de `sort` invalide le curseur : un curseur porte son tri et le
   serveur refuse un curseur repris avec un autre tri plutôt que de rendre des

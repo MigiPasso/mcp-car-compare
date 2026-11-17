@@ -28,11 +28,13 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
 from . import cursor as cursor_module
+from . import resume as resume_module
 from .config import DEFAULT_DB, Config, load_config
 from .cursor import Cursor, CursorError
 from .models import (
@@ -165,11 +167,34 @@ def register(
             return await _brands(source, market, make_source(client, market))
 
     @mcp.tool()
-    async def harvest(criteria: dict, budget_s: int | None = None) -> dict:
+    async def harvest(
+        criteria: dict, budget_s: int | None = None, resume: str | None = None
+    ) -> dict:
         """Récolte bornée : `budget_s` secondes **par source**, jamais dépassé
         (sans valeur : celui de la configuration, 60 s). Rend `{job_id,
-        coverage, cursor}` ; `cursor` est le curseur d'entrée de `offers`. Une
-        source coupée porte `status="capped"` et `read=0` si rien n'a été lu.
+        coverage, cursor, warnings, resumes}` ; `cursor` est le curseur d'entrée
+        de `offers`, et `resumes` les jetons de reprise des sources qui ne sont
+        pas allées au bout.
+
+        **Une récolte profonde se découpe en appels courts.** Mesuré le
+        2026-11-28 : `pages_max=20, budget_s=300` sur LaCentrale (~8 s/page,
+        navigateur) expirait côté client sans rien écrire, et le `cursor` rendu
+        ne reprenait pas la récolte — il pagine des annonces déjà lues. Chaque
+        source arrêtée en cours de lecture rend donc un **jeton de reprise**
+        dans `resumes` : `[{source, market, token}]`, vide quand tout est lu.
+        Deux sources peuvent s'arrêter ensemble, d'où une LISTE et non un jeton
+        unique.
+
+        `resume=<jeton>` reprend **cette source seule**, à sa page suivante,
+        dans le MÊME `job_id` : la couverture d'alors décrit le total depuis le
+        début du job (les compteurs s'accumulent), et le budget de l'appel
+        s'applique à la reprise — un jeton ne se refuse donc pas parce que le
+        budget a changé. Les critères, eux, doivent être les mêmes que ceux de
+        la récolte d'origine (un jeton d'autres critères est refusé, en le
+        nommant), et une récolte inconnue est refusée aussi. `pages_max` reste
+        le plafond de pages du job : une fois ce plafond atteint, il n'y a plus
+        de jeton, et `warnings` le dit au lieu de conseiller un réglage qui ne
+        lit rien de plus.
 
         **`criteria.make` et `criteria.model` sont des LIBELLÉS**, ceux que le
         site affiche et qu'`offers` écrit dans `make` et `group_label` :
@@ -187,11 +212,28 @@ def register(
         config = load_config()
         crit = _parse_criteria(criteria, pages_max=config.pages_max)
         budget = _parse_budget(budget_s, default=config.budget_s)
-        job_id = uuid.uuid4().hex
-        criteria_hash = cursor_module.hash_criteria(crit, budget)
+        # L'empreinte des critères SEULS : c'est elle que porte un jeton de
+        # reprise, parce que le budget d'une reprise est celui de l'appel qui
+        # reprend (voir `cursor.criteria_fingerprint`).
+        fingerprint = cursor_module.criteria_fingerprint(crit)
+        position: resume_module.ResumeToken | None = None
+        if resume is None:
+            job_id = uuid.uuid4().hex
+            criteria_hash = cursor_module.hash_criteria(crit, budget)
+        else:
+            position = resume_module.decode(resume)
+            resume_module.check(position, criteria=crit, criteria_hash=fingerprint)
+            job_id = position.job_id
         with Store(_corpus_path(db_path, config)) as store:
+            if position is not None:
+                # `Store.job` lève `UnknownJobError` : un jeton forgé ne crée pas
+                # une récolte fantôme. Et c'est l'empreinte DÉJÀ ÉCRITE qui fait
+                # foi — une reprise continue le job, elle ne lui donne pas une
+                # nouvelle identité, sans quoi deux curseurs d'`offers` du même
+                # job ne s'accorderaient plus.
+                criteria_hash = store.job(job_id).criteria_hash
             async with _client(injected is None) as client:
-                coverage = await _harvest_sources(
+                harvested = await _harvest_sources(
                     store,
                     job_id,
                     crit,
@@ -199,7 +241,22 @@ def register(
                     criteria_hash=criteria_hash,
                     make_source=make_source(client),
                     clock=clock,
+                    resume=position,
                 )
+        coverage = [item.coverage for item in harvested]
+        tokens = {
+            (item.coverage.source, item.coverage.market): resume_module.encode(
+                resume_module.ResumeToken(
+                    job_id=job_id,
+                    criteria_hash=fingerprint,
+                    source=item.coverage.source,
+                    market=item.coverage.market,
+                    next_page=item.next_page,
+                )
+            )
+            for item in harvested
+            if item.next_page is not None
+        }
         return {
             "job_id": job_id,
             "coverage": [row.as_dict() for row in coverage],
@@ -208,7 +265,7 @@ def register(
             # `job_id` croit avoir tout le marché. Le message dit combien il
             # manque ET quel levier tourner — sans quoi « incomplet » s'entend
             # comme une fatalité.
-            "warnings": _truncation_warnings(coverage, crit.pages_max),
+            "warnings": _truncation_warnings(coverage, tokens, crit.pages_max),
             "cursor": cursor_module.encode(
                 Cursor(
                     job_id=job_id,
@@ -217,6 +274,10 @@ def register(
                     criteria_hash=criteria_hash,
                 )
             ),
+            "resumes": [
+                {"source": source, "market": market, "token": token}
+                for (source, market), token in tokens.items()
+            ],
         }
 
     @mcp.tool()
@@ -467,7 +528,9 @@ def register(
 
 
 def _truncation_warnings(
-    coverage: list[SourceCoverage], pages_max: int
+    coverage: list[SourceCoverage],
+    tokens: dict[tuple[str, str], str],
+    pages_max: int,
 ) -> list[str]:
     """Une phrase par source qui s'est arrêtée avant la fin, avec le levier.
 
@@ -475,9 +538,13 @@ def _truncation_warnings(
     « pas d'avertissement sur une récolte complète » et donc de réfuter un
     message qui crierait au loup à chaque appel.
 
-    Le levier proposé est `MAX_PAGES`, pas `pages_max * 2` : un appelant qui
-    relit la même réponse ne doit pas se voir conseiller une valeur différente à
-    chaque fois, et le plafond du site est de toute façon la seule borne utile.
+    Le levier est le **jeton de reprise** de cette source, jamais un
+    `pages_max` plus grand : mesuré le 2026-11-28, « relance avec `pages_max=20` »
+    conseillait un appel qui expirait côté client (`Request timed out`), sans
+    rien écrire en base. Une consigne qui échoue est pire que pas de consigne —
+    c'est le défaut que ce lot corrige. Quand il n'y a plus de page à demander
+    (plafond `pages_max` du job, ou stock épuisé), le message le dit au lieu de
+    proposer un jeton qui ne mènerait à rien.
     """
     warnings: list[str] = []
     for row in coverage:
@@ -488,10 +555,15 @@ def _truncation_warnings(
             continue
         lues = f"{row.unique} annonce(s) lue(s)"
         annonce = f" sur {total} annoncée(s)" if total is not None else " (total annoncé inconnu)"
-        if pages_max < MAX_PAGES:
-            suite = f"relance avec pages_max={MAX_PAGES} pour élargir"
+        token = tokens.get((row.source, row.market))
+        if token is not None:
+            suite = f'relance avec resume="{token}" pour élargir'
         else:
-            suite = "le plafond de lecture est déjà au maximum : c'est la source qui s'arrête là"
+            suite = (
+                f"aucune page de plus à demander dans cette récolte "
+                f"(plafond pages_max={pages_max} atteint, ou arrêt de la source) "
+                f": une lecture plus large demande des critères plus étroits"
+            )
         warnings.append(f"{row.source} ({row.market}) : {lues}{annonce} — {suite}")
     return warnings
 
@@ -568,6 +640,27 @@ async def _brands(source: str, market: str, make_source: SourceFactory) -> dict:
 # --- récolte ------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _Harvested:
+    """Ce qu'un appel a rendu pour une paire `(source, market)`, et la page où
+    reprendre.
+
+    `next_page` vaut `None` quand il n'y a plus de page À DEMANDER pour cette
+    source dans ce job : la boucle s'est arrêtée sur le plafond `pages_max`, le
+    site n'annonçait plus rien, ou une page vide a montré que le stock est
+    épuisé. C'est cette valeur — et elle seule — qui décide s'il y a un jeton de
+    reprise à rendre : un jeton qui ne mènerait à aucune page serait la consigne
+    qui échoue que ce lot corrige (`RESTE-A-FAIRE.md` point 0).
+
+    Une source qui s'arrête sur le budget, sur une attente trop longue ou sur un
+    échec de page laisse au contraire la page qu'elle n'a pas lue : c'est là
+    qu'une reprise repart.
+    """
+
+    coverage: SourceCoverage
+    next_page: int | None
+
+
 async def _harvest_sources(
     store: Store,
     job_id: str,
@@ -577,9 +670,16 @@ async def _harvest_sources(
     criteria_hash: str,
     make_source: SourceFactory,
     clock: Callable[[], float],
-) -> list[SourceCoverage]:
-    """Récolte chaque `(source, market)`, avec un budget **par source**."""
-    coverage: list[SourceCoverage] = []
+    resume: resume_module.ResumeToken | None = None,
+) -> list[_Harvested]:
+    """Récolte chaque `(source, market)`, avec un budget **par source**.
+
+    `resume` restreint la récolte à la paire que le jeton désigne, à partir de
+    sa page : une reprise lit la SUITE d'une source, jamais le début des autres,
+    et c'est ce qui rend un jeton attribuable à une seule d'entre elles.
+    """
+    harvested: list[_Harvested] = []
+    start_page = resume.next_page if resume is not None else 1
     for source_name in criteria.sources:
         started = clock()
         try:
@@ -591,8 +691,10 @@ async def _harvest_sources(
             refusal = _failure(exc)
             refusal_status = _status_of(exc)
         for market in criteria.markets:
+            if resume is not None and (source_name, market) != (resume.source, resume.market):
+                continue
             if adapter is None:
-                coverage.append(
+                harvested.append(
                     _record_failed_run(
                         store,
                         job_id,
@@ -605,7 +707,7 @@ async def _harvest_sources(
                     )
                 )
                 continue
-            coverage.append(
+            harvested.append(
                 await _harvest_one(
                     store,
                     job_id,
@@ -617,9 +719,10 @@ async def _harvest_sources(
                     started=started,
                     clock=clock,
                     criteria_hash=criteria_hash,
+                    start_page=start_page,
                 )
             )
-    return coverage
+    return harvested
 
 
 async def _harvest_one(
@@ -634,10 +737,29 @@ async def _harvest_one(
     started: float,
     clock: Callable[[], float],
     criteria_hash: str,
-) -> SourceCoverage:
-    """Récolte une paire `(source, market)` jusqu'à épuisement, `pages_max` ou
-    budget. Ce qui a été lu est persisté page par page : une coupure ne perd
-    pas les pages déjà payées.
+    start_page: int = 1,
+) -> _Harvested:
+    """Récolte une paire `(source, market)` de `start_page` jusqu'à épuisement,
+    `pages_max` ou budget. Ce qui a été lu est persisté page par page : une
+    coupure ne perd pas les pages déjà payées.
+
+    **La couverture d'un job s'accumule.** `write_run` REMPLACE la ligne de la
+    paire — c'est ce qui garde une seule ligne par `(job_id, source, market)`, et
+    donc une seule identité par paire dans `corpus()` et `whole_corpus()` — donc
+    les compteurs déjà écrits sont relus ici et repris, jamais remis à zéro :
+    une reprise qui relit deux pages d'un job qui en a déjà lu six annonce
+    huit pages de couverture, pas deux. Le choix est délibéré : ajouter une ligne
+    par appel aurait changé la clé primaire de `runs`, et avec elle le sens de
+    `corpus()` (« une ligne par paire, celle de CETTE récolte »), pour un
+    historique dont personne n'a besoin — le total depuis le début du job est
+    exactement ce qu'un appelant qui reprend veut lire.
+
+    `read`, `dropped_duplicates`, `dropped_invalid` et `unique` sont ces
+    compteurs cumulés ; `status`, `truncated` et `reason` décrivent l'état APRÈS
+    cet appel (une reprise qui finit la lecture rend `truncated=False`, sans quoi
+    la source ne se déclarerait jamais couverte). `announced_total` est un
+    instantané du site, pas un compteur : il n'est pas additionné, et la valeur
+    déjà connue est gardée quand le site se tait dans l'appel qui reprend.
 
     Comptabilité tenue : `read` additionne ce que les PAGES ont rendu, doublons
     internes compris (`page.rendered`) — c'est un chiffre de LECTURE, pas de
@@ -659,12 +781,24 @@ async def _harvest_one(
     seule qu'une source puisse déclarer elle-même : un adaptateur qui lit
     plusieurs pages du site en une requête sait qu'il a coupé, et le dit par
     `Page.has_more` (voir `models.Page`).
+
+    La page où reprendre est rendue avec la couverture (`_Harvested`) : c'est
+    elle qui devient le jeton de reprise, et elle vaut `None` quand il n'y a plus
+    de page à demander.
     """
-    seen: set[tuple[str, str, str]] = set()
-    read = 0
-    dropped = 0
-    dropped_invalid = 0
-    announced_total: int | None = None
+    # Ce que le job a DÉJÀ écrit pour cette paire : les compteurs se cumulent et
+    # les annonces déjà vues ne sont pas des nouveautés. Sur un job neuf, les
+    # deux lectures sont vides — ce n'est pas une branche réservée aux reprises,
+    # c'est le même code qui répond aux deux cas.
+    prior = store.run(job_id, source_name, market)
+    seen: set[tuple[str, str, str]] = {
+        (source_name, market, source_id)
+        for source_id in store.run_listing_ids(job_id, source_name, market)
+    }
+    read = prior.read if prior is not None else 0
+    dropped = prior.dropped_duplicates if prior is not None else 0
+    dropped_invalid = prior.dropped_invalid if prior is not None else 0
+    announced_total: int | None = prior.announced_total if prior is not None else None
     # `has_more` s'ACCUMULE sur les pages déjà lues : la page 2 d'un lot rend
     # une page vide et sans suite (`has_more=False`), et l'écraser effacerait
     # l'aveu de troncature fait par la page 1 — le seul qui compte.
@@ -672,12 +806,18 @@ async def _harvest_one(
     status = "ok"
     truncated = False
     reason = ""
-    for page_number in range(1, criteria.pages_max + 1):
+    # La page où une reprise repartirait, ou `None` s'il n'y a plus rien à
+    # demander. Renseignée par CHAQUE sortie de boucle, faute de quoi la
+    # dernière branche gagnante laisserait la valeur d'une autre.
+    next_page: int | None = None
+    for page_number in range(max(1, start_page), criteria.pages_max + 1):
         remaining = budget_s - (clock() - started)
         if remaining <= 0:
             status = "capped"
             truncated = True
             reason = f"budget de {budget_s} s atteint après {len(seen)} annonce(s) distincte(s) ({read} lue(s))"
+            # La page n'a pas été lue : c'est elle que la reprise reprend.
+            next_page = page_number
             break
         try:
             # Le budget borne aussi l'attente en cours : une page qui traîne ne
@@ -691,11 +831,16 @@ async def _harvest_one(
                 f"budget de {budget_s} s atteint pendant la page {page_number} "
                 f"après {len(seen)} annonce(s) distincte(s) ({read} lue(s))"
             )
+            next_page = page_number
             break
         except Exception as exc:  # échec de source : dit, jamais 0 annonce muet
             status = _status_of(exc)
             truncated = True
             reason = _failure(exc)
+            # Un échec de page est rejouable : la reprise repart de celle qui a
+            # échoué. C'est ce qui rend un `challenge` DataDome reprenable plus
+            # tard sans reconstruire un job.
+            next_page = page_number
             break
         if announced_total is None:
             announced_total = page.announced_total
@@ -723,6 +868,16 @@ async def _harvest_one(
                     f"{announced_total} — plafond de lecture (pages_max="
                     f"{criteria.pages_max}) ou de la source"
                 )
+            # Une page vide ne dit pas la même chose selon la source. Pour une
+            # source PAGE PAR PAGE (AutoScout24), elle signifie « le site
+            # s'arrête » : une reprise à la suivante redemanderait une page vide
+            # et proposerait le même jeton, une consigne qui ne mène à rien.
+            # Pour une source en LOT (LaCentrale), elle signifie seulement « le
+            # lot demandé est épuisé » — et `has_more` le dit. Là, il reste des
+            # pages à demander : la reprise repart au-delà du plafond, avec un
+            # plafond plus grand (que `criteria_fingerprint` n'invalide plus).
+            if has_more:
+                next_page = criteria.pages_max + 1
             break
         read += page.rendered
         # Les doublons DANS la page ont déjà été retirés par l'adaptateur : ils
@@ -797,7 +952,7 @@ async def _harvest_one(
         reason=reason,
     )
     store.write_run(job_id, coverage, criteria_hash=criteria_hash, sort=criteria.sort)
-    return coverage
+    return _Harvested(coverage=coverage, next_page=next_page)
 
 
 def _record_failed_run(
@@ -810,22 +965,30 @@ def _record_failed_run(
     reason: str,
     criteria_hash: str,
     sort: str,
-) -> SourceCoverage:
+) -> _Harvested:
     """Une récolte qui n'a pas pu démarrer laisse quand même sa ligne : une
-    source absente du corpus doit s'y voir, avec zéro."""
+    source absente du corpus doit s'y voir, avec zéro.
+
+    Les compteurs DÉJÀ écrits par un appel précédent du même job sont repris, pas
+    écrasés : une reprise qui ne peut pas construire son adaptateur ne doit pas
+    effacer ce que le job a déjà lu. La page de reprise est la première de la
+    source, puisque aucune n'a été demandée.
+    """
+    prior = store.run(job_id, source_name, market)
     coverage = SourceCoverage(
         source=source_name,
         market=market,
         status=status,
-        read=0,
-        unique=0,
-        dropped_duplicates=0,
-        dropped_invalid=0,
+        announced_total=prior.announced_total if prior is not None else None,
+        read=prior.read if prior is not None else 0,
+        unique=prior.unique if prior is not None else 0,
+        dropped_duplicates=prior.dropped_duplicates if prior is not None else 0,
+        dropped_invalid=prior.dropped_invalid if prior is not None else 0,
         truncated=True,
         reason=reason,
     )
     store.write_run(job_id, coverage, criteria_hash=criteria_hash, sort=sort)
-    return coverage
+    return _Harvested(coverage=coverage, next_page=1)
 
 
 def _status_of(exc: BaseException) -> str:

@@ -3,17 +3,23 @@
 LaCentrale est protégée par DataDome : `curl` rend 403 et un HTTP simple ne lit
 aucune carte (PLAN.md §2). Cet adaptateur ne parle donc jamais au site. Il poste
 une adresse de recherche à un side-car Camoufox local — `POST
-http://127.0.0.1:8899/scrape`, `{"url": …, "max_pages": n}` — qui rend les cartes
-déjà mises au contrat, et il les convertit en `Listing`.
+http://127.0.0.1:8899/scrape`, `{"url": …, "max_pages": n, "start_page": p}` —
+qui rend les cartes déjà mises au contrat, et il les convertit en `Listing`.
 
 Quatre règles, chacune payée par un défaut mesuré ou par une règle du plan :
 
 - **Un seul appel par récolte, tout le lot en une `Page`.** Le side-car enchaîne
   les pages du site dans UNE session Camoufox (lancement ~30 s, résolution
   DataDome 6–75 s, 60 s mini entre deux lancements — PLAN.md §2). `search`
-  demande donc `max_pages = criteria.pages_max` à la première page, et les pages
-  suivantes rendent une page vide SANS requête : redemander relancerait un
-  navigateur pour des annonces déjà lues.
+  demande donc au side-car de lire de la page reçue jusqu'au plafond
+  `criteria.pages_max`, et les pages suivantes rendent une page vide SANS
+  requête : redemander relancerait un navigateur pour des annonces déjà lues.
+- **Une reprise repart de sa page.** `search(criteria, page_number)` demande
+  `start_page=page_number` : mesuré le 2026-11-28, une récolte LaCentrale
+  profonde dépasse le délai du client MCP (~8 s/page dans le navigateur) et
+  expirait sans rien écrire. Sans page de départ, reprendre voulait dire relire
+  depuis la page 1 — repayer les pages déjà payées et expirer de nouveau, donc
+  aucune récolte profonde possible.
 - **Un défi DataDome est un statut, pas zéro annonce.** Un 409 du side-car devient
   `SourceError(status="challenge")`, ce qui rend `coverage.status="challenge"`
   atteignable de bout en bout (règle du projet, PLAN.md §6 E4b).
@@ -310,20 +316,37 @@ class Lacentrale:
         self._client = client
         self._sidecar = sidecar_url.rstrip("/")
         self._timeout_s = timeout_s
+        # Le lot déjà demandé DANS CET APPEL. Un adaptateur est construit par
+        # récolte : la première page demandée fait lire au side-car toute la
+        # suite du plafond, donc les appels suivants ne doivent plus rien lui
+        # demander. C'est un drapeau et non un `page_number > 1` : une reprise
+        # commence à la page 5 et doit demander son lot, là où une seconde page
+        # à partir de 1 ne demande rien.
+        self._lot_requested = False
 
     async def search(self, criteria: Criteria, page_number: int) -> Page:
         """Le lot de résultats d'une récolte, en une requête au side-car.
 
-        `page_number > 1` rend une page vide sans aucune requête : la première a
-        déjà demandé `criteria.pages_max` pages au side-car, qui les enchaîne
-        dans sa session Camoufox. Redemander relancerait un navigateur pour des
-        annonces déjà lues, et l'aveu de troncature a été fait là-bas, par
-        `has_more`.
+        `page_number` est la page du SITE où ce lot commence : 1 pour une
+        récolte neuve, la page de reprise pour une reprise. Le side-car lit
+        `pages_max - page_number + 1` pages à partir de là — la borne est celle
+        du job, pas celle de l'appel, sinon une récolte reprise pourrait lire
+        plus de pages que le plafond qu'elle s'est donné.
+
+        Un second appel de la MÊME instance rend une page vide sans aucune
+        requête : le premier a déjà demandé tout le lot, et redemander
+        relancerait un navigateur pour des annonces déjà lues — l'aveu de
+        troncature, lui, a été fait là-bas, par `has_more`.
         """
         _market_of(criteria)
-        if page_number > 1:
+        if self._lot_requested:
             return Page(listings=[], page_number=page_number)
-        payload = await self._scrape(search_url(criteria), max_pages=criteria.pages_max)
+        self._lot_requested = True
+        payload = await self._scrape(
+            search_url(criteria),
+            max_pages=criteria.pages_max - page_number + 1,
+            start_page=page_number,
+        )
         return parse_scrape(payload, page_number)
 
     async def brands(self) -> list[dict]:
@@ -341,7 +364,7 @@ class Lacentrale:
             "ce sont ceux que search attend"
         )
 
-    async def _scrape(self, url: str, *, max_pages: int) -> object:
+    async def _scrape(self, url: str, *, max_pages: int, start_page: int) -> object:
         """Poste l'adresse au side-car et rend sa charge JSON.
 
         Les échecs sont nommés séparément parce qu'ils ne disent pas la même
@@ -353,7 +376,7 @@ class Lacentrale:
         try:
             response = await self._client.post(
                 f"{self._sidecar}/scrape",
-                json={"url": url, "max_pages": max_pages},
+                json={"url": url, "max_pages": max_pages, "start_page": start_page},
                 timeout=self._timeout_s,
             )
         except httpx.HTTPError as exc:

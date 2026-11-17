@@ -136,12 +136,16 @@ Quatre outils, par fonction. Chaque réponse porte un bloc `coverage`.
 // 1. list_brands(source?, market="fr") -> {source, market, brands:[{value,label}], error?}
 //      instantané. Pas de `models` en v1 : la page de taxonomie ne les porte pas,
 //      et un champ toujours vide est une promesse creuse (revue du 16/11).
-// 2. harvest(criteria, budget_s=60, sources?) -> {job_id, coverage, cursor}
+// 2. harvest(criteria, budget_s=60, sources?, resume?) -> {job_id, coverage,
+//      cursor, warnings, resumes}
 //      criteria = {make, model, year_min, year_max, km_max, price_min,
 //                  price_max, fuel, gear, markets, pages_max, sort}
 //      `make` et `model` sont des LIBELLÉS du site (« BMW », « Série 3 » ou le
 //      `group` « serie 3 ») : la marque et la gamme se filtrent par le CHEMIN
 //      (/lst/bmw/serie-3, §8) ; un `model` exige `make`, un 404 est un refus nommé.
+//      `resumes` = [{source, market, token}] : les sources qui ne sont pas allées
+//      au bout, chacune avec son jeton de reprise (`resume=<token>` reprend
+//      cette source seule, à sa page suivante, dans le même `job_id`).
 // 3. offers(job_id, cursor?, limit=25) -> {items:[Listing], next_cursor|null,
 //      has_more, coverage}
 // 4. analyze_models(criteria) -> {groups:[{key,label,n,price_median,
@@ -188,9 +192,10 @@ corpus qui y correspond, récoltes confondues — sinon l'analyse d'un marché
 dépendrait de l'ordre des appels.
 
 **`harvest` est borné par source, pas globalement.** `budget_s` s'applique à
-chaque source ; celles qui ne rentrent pas rendent `status:"capped"` avec
-`read:0` et un curseur de reprise. Il ne dépasse jamais le budget. Ce n'est pas
-un scheduler, c'est une reprise explicite.
+chaque source ; celles qui ne rentrent pas rendent `status:"capped"` et un
+**jeton de reprise** dans `resumes`. Il ne dépasse jamais le budget. Ce n'est
+pas un scheduler, c'est une reprise explicite : la couverture d'une reprise
+décrit le total depuis le début du job, jamais le dernier appel.
 
 **LaCentrale ne rentre pas dans un budget court.** Mesuré dans ICH : ~30 s de
 lancement de navigateur puis 6–75 s de résolution DataDome avant la première

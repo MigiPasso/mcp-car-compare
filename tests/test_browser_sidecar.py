@@ -226,6 +226,26 @@ def test_un_nombre_de_pages_non_entier_est_refuse():
         sidecar.allowed_pages("3")
 
 
+@pytest.mark.parametrize("raw,attendu", [
+    (None, 1),
+    (1, 1),
+    (5, 5),
+    # Une page 0 n'existe pas, et au-delà du plafond le site ne rend rien :
+    # hors bornes, la valeur est ramenée dans les bornes — c'est un plafond, pas
+    # une faute de frappe.
+    (0, 1),
+    (-3, 1),
+    (10**6, sidecar.MAX_PAGES_CAP),
+])
+def test_la_page_de_depart_est_bornee(raw, attendu):
+    assert sidecar.allowed_start_page(raw) == attendu
+
+
+def test_une_page_de_depart_non_entiere_est_refusee():
+    with pytest.raises(sidecar.BadRequest):
+        sidecar.allowed_start_page("5")
+
+
 def test_l_adresse_de_la_page_suivante_ajoute_le_parametre_de_page():
     url = "https://www.lacentrale.fr/listing?makesModelsCommercialNames=BMW::SERIE 3&page=1"
 
@@ -332,6 +352,48 @@ def test_une_fin_de_stock_n_est_pas_declaree_partielle():
     assert len(result["vehicles"]) == 1
     assert result["pages_read"] == 1
     assert result["partial"] is False
+
+
+def test_une_reprise_commence_a_sa_page_et_ne_relit_pas_les_precedentes():
+    # Ce que la reprise existe pour faire : lire la SUITE d'un stock, à partir
+    # de la page demandée. La page 5 payée dans un appel précédent n'est pas
+    # repayée ici, et le plafond du side-car borne toujours la lecture absolue.
+    browser = FakeBrowser(fixture("search_fr.html"), fixture("search_fr.html"))
+
+    result = run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 2,
+                                      start_page=5,
+                                      browser_factory=session(browser)))
+
+    visited = [page.visited[0] for page in browser.opened]
+    assert [url.rsplit("=", 1)[-1] for url in visited] == ["5", "6"]
+    assert result["pages_read"] == 6
+
+
+def test_une_reprise_au_dela_du_stock_rend_une_reponse_vide_et_pas_une_erreur():
+    # Le stock peut s'arrêter avant la page demandée : c'est la fin normale d'une
+    # reprise. La traiter comme une page 1 illisible (`ScrapeFailed`) rendrait
+    # toute reprise au-delà du stock impossible — et un jeton qui échoue est
+    # exactement le défaut que la récolte reprenable corrige.
+    browser = FakeBrowser(EMPTY_PAGE)
+
+    result = run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 2,
+                                      start_page=3,
+                                      browser_factory=session(browser)))
+
+    assert result["vehicles"] == []
+    assert result["pages_read"] == 0
+    assert result["partial"] is True
+
+
+def test_un_defi_sur_la_premiere_page_lue_d_une_reprise_leve_challenge():
+    # Une reprise paie la résolution DataDome comme la page 1 : le défi se
+    # détecte donc sur la première page LUE, pas sur le numéro 1.
+    browser = FakeBrowser(fixture("challenge.html"))
+
+    with pytest.raises(sidecar.Challenge):
+        run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 2,
+                                 start_page=4,
+                                 browser_factory=session(browser)))
 
 
 # --- Un DOM minuscule, juste assez pour les sélecteurs du side-car -----------

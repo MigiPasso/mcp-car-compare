@@ -106,6 +106,9 @@ REQUEST_TIMEOUT_S = 180.0
 MAX_PAGES_CAP = 20
 PAGINATION_PARAM = "page"
 
+# Page de départ quand l'appelant ne s'en prononce pas : le début.
+FIRST_PAGE = 1
+
 # --- Extraction DOM (sélecteurs éprouvés, repris d'ICH) ----------------------
 # La carte EST l'ancre de l'annonce : `a[href*='auto-occasion-annonce']` englobe
 # le titre, le sous-titre, le prix, les puces et l'image.
@@ -237,6 +240,27 @@ def allowed_pages(raw: object) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise BadRequest("champ « max_pages » : un entier est attendu")
     return max(1, min(raw, MAX_PAGES_CAP))
+
+
+def allowed_start_page(raw: object) -> int:
+    """Page où COMMENCER la lecture, `1` par défaut.
+
+    C'est ce qui rend une reprise de récolte possible sans relire depuis le
+    début : mesuré, un `harvest` LaCentrale profond dépasse le délai du client
+    MCP (~8 s/page dans le navigateur), et sans page de départ la seule reprise
+    possible était de tout relire — donc de repayer les pages déjà payées et de
+    dépasser le délai de nouveau.
+
+    Bornes : `1` au moins (une page 0 n'existe pas), `MAX_PAGES_CAP` au plus
+    (au-delà, le site ne rend rien). Comme `allowed_pages`, une valeur hors
+    bornes est ramenée dans les bornes plutôt que refusée : c'est un plafond,
+    pas une faute de frappe.
+    """
+    if raw is None:
+        return FIRST_PAGE
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise BadRequest("champ « start_page » : un entier est attendu")
+    return max(FIRST_PAGE, min(raw, MAX_PAGES_CAP))
 
 
 def page_url(url: str, page_number: int) -> str:
@@ -568,33 +592,58 @@ async def scrape_pages(
     url: str,
     max_pages: int,
     *,
+    start_page: int = FIRST_PAGE,
     browser_factory: Callable[[], Any] = open_browser,
 ) -> dict:
-    """Lit `max_pages` pages de résultats dans UNE session de navigateur.
+    """Lit `max_pages` pages de résultats à partir de `start_page`, dans UNE
+    session de navigateur.
+
+    `start_page` est la page du SITE où commencer : une reprise de récolte
+    reprend à la page suivante sans relire (ni repayer) celles déjà lues, et
+    c'est le seul moyen pour LaCentrale de rentrer dans le délai d'un client
+    MCP (~8 s/page dans le navigateur).
 
     Une page NEUVE par navigation : le lancement et la résolution du défi sont
     payés une fois, mais chaque document est libéré avec sa page (réutiliser la
     même page tue le processus de contenu à la 4ᵉ page, mesuré dans ICH).
 
-    Une page 1 sans carte ne rend JAMAIS un résultat vide : c'est un défi (409)
-    ou une page qu'on ne sait plus lire (502). Un `{"vehicles": []}` en 200 se
-    lirait comme un marché désert, et c'est exactement ce que ce projet refuse.
+    Une première page LUE sans carte ne rend JAMAIS un résultat vide quand c'est
+    aussi la page 1 du site : c'est un défi (409) ou une page qu'on ne sait plus
+    lire (502). Un `{"vehicles": []}` en 200 se lirait comme un marché désert,
+    et c'est exactement ce que ce projet refuse. À partir d'une page de reprise,
+    une page vide veut dire « il n'y a plus rien à lire » — c'est le cas normal
+    d'une reprise qui repart au-delà du stock, et le refuser transformerait une
+    fin de stock en panne.
     """
     async with _launch_turn():
         async with browser_factory() as browser:
-            return await _paginate(browser, url, max_pages)
+            return await _paginate(browser, url, max_pages, start_page)
 
 
-async def _paginate(browser: Any, url: str, max_pages: int) -> dict:
-    """Boucle sur les pages et accumule les annonces. Voir `scrape_pages`."""
+async def _paginate(
+    browser: Any, url: str, max_pages: int, start_page: int = FIRST_PAGE
+) -> dict:
+    """Boucle sur les pages et accumule les annonces. Voir `scrape_pages`.
+
+    `first_read` est la première page LUE dans cette session : c'est elle qui
+    paie la résolution du défi et porte les conclusions de la page 1 — le
+    délai long, et le refus d'un résultat vide. La comparer à `1` en dur
+    rendrait une reprise à la page 5 sans attente de cartes et sans refus, donc
+    silencieusement vide.
+    """
     started = _clock()
     vehicles: list[dict] = []
     seen: set[str] = set()
     announced_total: int | None = None
     pages_read = 0
     partial = False
+    first_read = max(FIRST_PAGE, start_page)
+    # Le plafond du side-car borne la lecture ABSOLUE, pas le nombre de pages de
+    # la requête : sans lui, `start_page=19&max_pages=20` demanderait 39 pages
+    # à un site qui n'en rend que 20.
+    last_page = min(first_read + max_pages - 1, MAX_PAGES_CAP)
 
-    for number in range(1, max_pages + 1):
+    for number in range(first_read, last_page + 1):
         if _clock() - started > SCRAPE_DEADLINE_S:
             LOGGER.warning("délai de %.0f s atteint avant la page %d",
                            SCRAPE_DEADLINE_S, number)
@@ -607,7 +656,7 @@ async def _paginate(browser: Any, url: str, max_pages: int) -> dict:
             # payer le chargement complet des vignettes avant chaque lecture.
             await page.goto(page_url(url, number), wait_until="domcontentloaded")
             await _wait_cards(
-                page, FIRST_PAGE_TIMEOUT_S if number == 1 else NEXT_PAGE_TIMEOUT_S
+                page, FIRST_PAGE_TIMEOUT_S if number == first_read else NEXT_PAGE_TIMEOUT_S
             )
             text = await body_text(page)
             if announced_total is None:
@@ -615,12 +664,15 @@ async def _paginate(browser: Any, url: str, max_pages: int) -> dict:
             page_vehicles = await read_page(page, number)
             if not page_vehicles:
                 if await is_challenge(page, text):
-                    if number == 1:
-                        raise Challenge("défi anti-robot sur la page 1")
+                    if number == first_read:
+                        raise Challenge(f"défi anti-robot sur la page {number}")
                     partial = True
                     LOGGER.warning("défi anti-robot à la page %d : lecture partielle", number)
                     break
-                if number == 1:
+                # La page 1 du SITE, à condition que ce soit aussi la première
+                # page lue : une page 3 vide d'une lecture commencée à la page 1
+                # est une fin de stock, pas une structure cassée.
+                if number == first_read == FIRST_PAGE:
                     raise ScrapeFailed(
                         "la page 1 n'a rendu aucune carte et n'est pas un défi : "
                         "structure changée ou adresse sans résultat"
@@ -629,6 +681,9 @@ async def _paginate(browser: Any, url: str, max_pages: int) -> dict:
                 # n'annonçait pas davantage. Sinon (page trop lente, paramètre
                 # de pagination ignoré) la lecture est courte, et le dire évite
                 # de faire passer un marché tronqué pour un marché complet.
+                #
+                # À partir d'une page de reprise, une page vide est un cas
+                # NORMAL : le stock peut s'arrêter avant la page demandée.
                 if announced_total is None or len(vehicles) < announced_total:
                     partial = True
                 LOGGER.warning("page %d sans carte : lecture partielle", number)
@@ -696,8 +751,13 @@ def create_app() -> Any:
         Statuts : 200 avec les champs du contrat, 400 sur une requête hors
         contrat (URL d'un autre hôte comprise), 409 sur un défi anti-robot,
         502 sur une page illisible ou une panne du navigateur. Un 200 avec zéro
-        véhicule n'existe pas. Un corps qui n'est pas un objet JSON reçoit le
-        422 de FastAPI, avant que ce code le voie.
+        véhicule n'existe pas POUR UNE LECTURE QUI COMMENCE À LA PAGE 1 : c'est
+        la règle qui empêche un marché désert de ressembler à un site qu'on ne
+        sait plus lire. À partir d'une page de reprise (`start_page` > 1), zéro
+        véhicule est la réponse honnête d'un stock épuisé avant cette page — et
+        la refuser transformerait une fin de stock en panne, ce qui rendrait
+        toute reprise au-delà du stock impossible. Un corps qui n'est pas un
+        objet JSON reçoit le 422 de FastAPI, avant que ce code le voie.
 
         `payload: dict` plutôt que `request: Request` : une annotation de type
         `Request` ne se résout pas quand l'import de FastAPI est local (le nom
@@ -708,8 +768,9 @@ def create_app() -> Any:
         try:
             url = check_url(payload.get("url"))
             max_pages = allowed_pages(payload.get("max_pages"))
+            start_page = allowed_start_page(payload.get("start_page"))
             async with asyncio.timeout(REQUEST_TIMEOUT_S):
-                result = await scrape_pages(url, max_pages)
+                result = await scrape_pages(url, max_pages, start_page=start_page)
         except BadRequest as exc:
             return JSONResponse(status_code=400, content={"error": str(exc)})
         except Challenge as exc:
@@ -731,10 +792,12 @@ def create_app() -> Any:
                 status_code=502,
                 content={"error": "lecture impossible : " + f"{type(exc).__name__}: {exc}"},
             )
-        if not result["vehicles"]:
-            # Filet de sécurité : aucune branche ci-dessus ne produit ce cas,
-            # et s'il apparaissait, un 200 vide serait le mensonge que ce
-            # side-car existe pour empêcher.
+        if not result["vehicles"] and start_page == FIRST_PAGE:
+            # Filet de sécurité : aucune branche ci-dessus ne produit ce cas, et
+            # s'il apparaissait, un 200 vide serait le mensonge que ce side-car
+            # existe pour empêcher. Il ne vaut que pour une lecture qui commence
+            # au début : une reprise au-delà du stock n'a légitimement rien à
+            # rendre.
             return JSONResponse(
                 status_code=502,
                 content={"error": "aucune annonce lue : résultat vide refusé"},

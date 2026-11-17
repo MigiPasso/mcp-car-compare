@@ -620,6 +620,56 @@ class Store:
             raise UnknownJobError(f"récolte inconnue : {job_id!r}")
         return JobCriteria(sort=row["sort"], criteria_hash=row["criteria_hash"])
 
+    def run(self, job_id: str, source: str, market: str) -> SourceCoverage | None:
+        """La ligne de récolte déjà écrite pour une paire, ou `None`.
+
+        Lue par une REPRISE (`tools._harvest_one`) : la couverture d'un job
+        décrit le total depuis son début, donc les compteurs d'une reprise
+        s'ajoutent à ceux déjà écrits au lieu de les remplacer. `write_run`
+        remplace la ligne — c'est ce qui garde une seule ligne par
+        `(job_id, source, market)` — et c'est donc à l'appelant de lire avant
+        d'écrire. Sans cette lecture, une reprise qui relit deux pages
+        annoncerait deux pages de couverture pour en avoir lu vingt.
+        """
+        row = self._conn.execute(
+            'SELECT "source", "market", "status", "announced_total", "read", '
+            '"unique", "dropped_duplicates", "dropped_invalid", "truncated", '
+            '"reason" FROM "runs" '
+            'WHERE "job_id" = ? AND "source" = ? AND "market" = ?',
+            (job_id, source, market),
+        ).fetchone()
+        if row is None:
+            return None
+        return SourceCoverage(
+            source=row["source"],
+            market=row["market"],
+            status=row["status"],
+            announced_total=row["announced_total"],
+            read=row["read"],
+            unique=row["unique"],
+            dropped_duplicates=row["dropped_duplicates"],
+            dropped_invalid=row["dropped_invalid"],
+            truncated=bool(row["truncated"]),
+            reason=row["reason"],
+        )
+
+    def run_listing_ids(self, job_id: str, source: str, market: str) -> set[str]:
+        """Les `source_id` déjà rattachés à cette récolte pour cette paire.
+
+        C'est le `seen` d'une reprise : une annonce lue par l'appel précédent et
+        revue par celui-ci est un DOUBLON de la récolte, pas une annonce neuve.
+        Sans cette lecture, `unique` compterait deux fois la carte mise en avant
+        qui revient en tête de chaque page, et l'identité `read == unique +
+        dropped_duplicates + dropped_invalid` ne se refermerait plus sur une
+        récolte reprise.
+        """
+        rows = self._conn.execute(
+            'SELECT "source_id" FROM "run_listings" '
+            'WHERE "job_id" = ? AND "source" = ? AND "market" = ?',
+            (job_id, source, market),
+        ).fetchall()
+        return {row["source_id"] for row in rows}
+
     def page(
         self, job_id: str, *, sort: str, offset: int, limit: int
     ) -> tuple[list[Listing], bool]:
