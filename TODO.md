@@ -57,10 +57,21 @@ de 3 pages, jamais une de 20.
 ~20 Ko dans le contexte d'un modèle, pour en choisir une. Un filtre par préfixe,
 ou une limite, serait plus propre.
 
-### 3. Rien ne purge le corpus
+### 3. ~~Rien ne purge le corpus~~ — FAIT autrement (2026-11-17)
 
-Il grossit à chaque récolte et les médianes portent sur tout l'historique. Une
-rétention, ou un `harvest` qui remplace, reste à décider.
+Décision : **pas de purge**, qui détruit et n'apprend rien à l'appelant. On a rendu
+l'âge **visible** à la place : chaque annonce porte `last_seen_at` (rafraîchie à
+chaque relecture), et `offers` comme `analyze_models` rendent un bloc `corpus_age`
+à côté de `coverage`. Au-delà de sept jours, `analyze_models` ajoute un
+avertissement en jours — et se tait en deçà.
+
+Limite écrite dans les docstrings : `corpus_age` à `null`/`null` veut dire
+« aucune annonce datée » (corpus vide **ou** base migrée dont les annonces
+précèdent la colonne), et dans ce second cas aucun avertissement de fraîcheur ne
+peut parler — c'est `coverage.listings_distinct` qui sépare les deux cas.
+
+Reste possible plus tard, non fait : décider d'une rétention. Ce n'est plus un
+mensonge, seulement un choix de volume.
 
 ### 4. La source navigateur peut se défendre demain
 
