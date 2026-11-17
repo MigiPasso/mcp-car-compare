@@ -174,6 +174,10 @@ def register(
         « Série 3 »), donc rien n'oblige à l'appeler avant une recherche. Il rend
         ~300 marques d'un coup (~20 Ko) : c'est de la découverte, à faire une fois
         si l'on ne sait pas comment le site nomme une marque — pas à chaque requête.
+
+        **Catalogue disponible pour AutoScout24 uniquement. Les autres sources
+        acceptent ces libellés tels quels** (« Renault », « Série 3 ») : inutile
+        d'y chercher un catalogue, il n'y en a pas et il n'en faut pas.
         """
         if source not in SOURCES:
             raise ValueError(f"source inconnue : {source!r} (attendu : {', '.join(SOURCES)})")
