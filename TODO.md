@@ -89,7 +89,6 @@ chargement, 24 par défilement jusqu'à 486, aucune pagination par URL.
 - **Le guard bloque les commandes contenant `.key`** (il y voit une clé privée) : `Listing.key()` en commentaire déclenche un faux positif. Passer par l'outil d'édition.
 - **Une image reconstruite ne change pas un conteneur déjà lancé** : recycler avant de tester, sinon on valide l'ancien code. Arrivé trois fois.
 - **Un client qui tourne garde les descriptions d'outils en mémoire** : après un changement de description, relancer Claude ou pi.
-- **`pkill -f claude-desktop` se tue lui-même** (le motif est dans sa propre ligne de commande) et laisse le processus principal en vie. Tuer par PID, puis retirer les `Singleton*` de `~/.config/Claude`.
 - **L'image de test fige `tests/` au build** : après avoir touché un test, la commande par montage du dépôt fait foi.
 
 ## Commandes
