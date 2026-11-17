@@ -110,7 +110,16 @@ def install(tmp_path, source: ScriptedSource) -> FakeMcp:
 def harvest(mcp: FakeMcp, criteria: dict | None = None, budget_s: int | None = None) -> dict:
     # `budget_s=None` laisse l'outil prendre celui de la configuration, comme un
     # client qui n'en passe pas.
-    return asyncio.run(mcp.tools["harvest"](criteria or {}, budget_s))
+    #
+    # **Une seule source ici, explicitement.** Le défaut de l'outil est
+    # maintenant « toutes les sources servies » (mesuré le 2026-11-28 : un appel
+    # sans `sources` n'en récoltait qu'une, et le modèle en concluait qu'il n'y
+    # en avait pas d'autre). Ces tests-ci éprouvent la mécanique d'UNE source —
+    # budget, pages, couverture, reprise — et le défaut est couvert par
+    # `test_harvest_sans_sources_interroge_toutes_les_sources_servies`.
+    return asyncio.run(
+        mcp.tools["harvest"]({"sources": ["autoscout24"], **(criteria or {})}, budget_s)
+    )
 
 
 # --- côté harvest --------------------------------------------------------------

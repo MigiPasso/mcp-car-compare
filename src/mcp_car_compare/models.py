@@ -258,7 +258,13 @@ class Criteria:
     fuel: str = ""
     gear: str = ""
     markets: tuple[str, ...] = ("fr",)
-    sources: tuple[str, ...] = ("autoscout24",)
+    # TOUTES les sources servies par défaut, et pas la première : mesuré le
+    # 2026-11-28 sur une vraie session, un appel qui ne précisait rien ne
+    # récoltait qu'une source sur deux, et le modèle a répondu « je ne sais pas
+    # si d'autres sources sont disponibles ». Un défaut qui cache la moitié du
+    # marché sans le dire est le défaut, pas la formulation. Une source précise
+    # reste demandable ; c'est le choix explicite qui restreint.
+    sources: tuple[str, ...] = SERVED_SOURCES
     pages_max: int = 10
     sort: str = DEFAULT_SORT
 

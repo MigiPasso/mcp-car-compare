@@ -45,8 +45,10 @@ def build_server() -> FastMCP:
     server = FastMCP(
         "mcp-car-compare",
         instructions=(
-            "Récolte d'annonces automobiles (AutoScout24 .fr/.de) dans un corpus "
-            "SQLite local. Chaque réponse de harvest et offers porte un bloc "
+            "Récolte d'annonces automobiles depuis **toutes** les sources servies "
+            "(deux aujourd'hui, voir `list_brands`) vers un corpus SQLite local. "
+            "`harvest` sans `sources` les interroge toutes : restreindre est un "
+            "choix explicite. Chaque réponse de harvest et offers porte un bloc "
             "coverage : lire `read`/`unique`/`truncated` avant de conclure quoi "
             "que ce soit sur la couverture du marché."
         ),

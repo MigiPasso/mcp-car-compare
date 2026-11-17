@@ -178,6 +178,13 @@ def register(
         de `offers`, et `resumes` les jetons de reprise des sources qui ne sont
         pas allées au bout.
 
+        **Sans `sources`, TOUTES les sources servies sont interrogées** — c'est
+        le défaut, et `coverage` en rend une ligne par source. Restreindre est un
+        choix explicite (`sources: ["…"]`). Les identifiants disponibles se
+        lisent dans `list_brands`. Une récolte large coûte plus cher : la source
+        qui passe par un navigateur paie ~20 s de démarrage, une seule fois par
+        appel.
+
         **Une récolte profonde se découpe en appels courts.** Mesuré le
         2026-11-28 : `pages_max=20, budget_s=300` sur LaCentrale (~8 s/page,
         navigateur) expirait côté client sans rien écrire, et le `cursor` rendu
@@ -1101,7 +1108,7 @@ def _parse_criteria(raw: dict, *, pages_max: int) -> Criteria:
     if gear not in GEARS:
         raise ValueError(f"boîte inconnue : {gear!r} (attendu : {', '.join(GEARS)})")
     markets = _vocabulary(raw.get("markets", MARKETS[:1]), MARKETS, "marché")
-    sources = _vocabulary(raw.get("sources", SOURCES[:1]), SOURCES, "source")
+    sources = _vocabulary(raw.get("sources", SERVED_SOURCES), SOURCES, "source")
     # Une source du vocabulaire sans adaptateur est refusée ICI, avant la
     # première requête : l'accepter pour rendre un `status="error"` plus loin
     # ferait passer un périmètre pour une panne du site, et l'appelant

@@ -45,7 +45,11 @@ def harvest(
     budget_s: int | None = None,
     resume: str | None = None,
 ) -> dict:
-    return asyncio.run(mcp.tools["harvest"](criteria, budget_s, resume))
+    # Une source explicite : le défaut de l'outil est désormais toutes les
+    # sources servies, et ces tests portent sur la reprise d'UNE source.
+    return asyncio.run(
+        mcp.tools["harvest"]({"sources": ["autoscout24"], **criteria}, budget_s, resume)
+    )
 
 
 def slow_install(tmp_path, pages: int, *, seconds_per_page: float = 40.0):
@@ -136,7 +140,11 @@ def test_une_reprise_avec_d_autres_criteres_est_refusee_en_le_nommant(tmp_path):
 
 def test_une_reprise_d_une_recolte_inconnue_est_refusee(tmp_path):
     mcp, _source = slow_install(tmp_path, pages=5)
-    fingerprint = cursor_module.criteria_fingerprint(Criteria(pages_max=3))
+    # Mêmes critères que l'appel : le helper ajoute `sources`, et l'empreinte
+    # porte les critères (pas les bornes de lecture).
+    fingerprint = cursor_module.criteria_fingerprint(
+        Criteria(pages_max=3, sources=("autoscout24",))
+    )
     forgeron = resume_module.encode(
         resume_module.ResumeToken(
             job_id="jamais-ecrit",

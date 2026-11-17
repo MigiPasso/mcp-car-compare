@@ -624,6 +624,8 @@ def test_un_filtre_de_carburant_reste_accepte_pour_autoscout24(tmp_path, monkeyp
     mcp = FakeMcp()
     tools.register(mcp, db_path=tmp_path / "corpus.db")
     result = asyncio.run(
-        mcp.tools["harvest"]({"fuel": "diesel", "pages_max": 1}, None)
+        mcp.tools["harvest"](
+            {"fuel": "diesel", "pages_max": 1, "sources": ["autoscout24"]}, None
+        )
     )
     assert [row["source"] for row in result["coverage"]] == ["autoscout24"]

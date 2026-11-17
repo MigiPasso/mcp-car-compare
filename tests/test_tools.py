@@ -159,7 +159,16 @@ def install(tmp_path, source: FakeSource, *, clock=None, db_path=None) -> FakeMc
 def harvest(mcp: FakeMcp, criteria: dict | None = None, budget_s: int | None = None) -> dict:
     # `budget_s=None` laisse l'outil prendre celui de la configuration, comme un
     # client qui n'en passe pas.
-    return asyncio.run(mcp.tools["harvest"](criteria or {}, budget_s))
+    #
+    # **Une seule source ici, explicitement.** Le défaut de l'outil est
+    # maintenant « toutes les sources servies » (mesuré le 2026-11-28 : un appel
+    # sans `sources` n'en récoltait qu'une, et le modèle en concluait qu'il n'y
+    # en avait pas d'autre). Ces tests-ci éprouvent la mécanique d'UNE source —
+    # budget, pages, couverture, reprise — et le défaut est couvert par
+    # `test_harvest_sans_sources_interroge_toutes_les_sources_servies`.
+    return asyncio.run(
+        mcp.tools["harvest"]({"sources": ["autoscout24"], **(criteria or {})}, budget_s)
+    )
 
 
 def brands(mcp: FakeMcp, source: str = "autoscout24", market: str = "fr") -> dict:
@@ -1034,3 +1043,34 @@ def test_le_plafond_de_pages_depend_de_la_source_demandee(tmp_path):
     assert tools._parse_criteria({"sources": ["lacentrale"], "pages_max": MAX_PAGES + 1}, pages_max=5)
     with pytest.raises(ValueError, match="autoscout24 : 20"):
         tools._parse_criteria({"sources": ["autoscout24"], "pages_max": MAX_PAGES + 1}, pages_max=5)
+
+
+def test_harvest_sans_sources_interroge_toutes_les_sources_servies(tmp_path):
+    # Le défaut, mesuré le 2026-11-28 sur une vraie session : un appel sans
+    # `sources` ne récoltait qu'AutoScout24, et le modèle répondait « je ne sais
+    # pas si d'autres sources sont disponibles » — la moitié du marché disparue
+    # sans un mot. Le défaut est désormais TOUTES les sources servies, et
+    # restreindre devient le geste explicite.
+    from mcp_car_compare.models import SERVED_SOURCES
+
+    seen: list[str] = []
+
+    def factory(name: str):
+        seen.append(name)
+        return FakeSource([Page(listings=[listing(1)], announced_total=1)])
+
+    mcp = FakeMcp()
+    tools.register(mcp, db_path=tmp_path / "corpus.db", source_factory=factory,
+                   clock=lambda: 0.0)
+    result = asyncio.run(mcp.tools["harvest"]({}, None))
+
+    assert set(seen) == set(SERVED_SOURCES), "chaque source servie doit être interrogée"
+    assert [row["source"] for row in result["coverage"]] == list(SERVED_SOURCES)
+
+
+def test_restreindre_les_sources_reste_possible(tmp_path):
+    # Le pendant : une source demandée reste la seule interrogée, sinon le
+    # nouveau défaut aurait rendu impossible de poser la question à une seule.
+    mcp = install(tmp_path, FakeSource([Page(listings=[listing(1)], announced_total=1)]))
+    result = harvest(mcp, {"sources": ["autoscout24"]})
+    assert [row["source"] for row in result["coverage"]] == ["autoscout24"]
