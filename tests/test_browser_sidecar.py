@@ -374,11 +374,6 @@ def test_une_reprise_au_dela_du_stock_rend_une_reponse_vide_et_pas_une_erreur():
     # reprise. La traiter comme une page 1 illisible (`ScrapeFailed`) rendrait
     # toute reprise au-delà du stock impossible — et un jeton qui échoue est
     # exactement le défaut que la récolte reprenable corrige.
-    #
-    # `partial` est FAUX : la reprise sonde la page suivante, la trouve vide elle
-    # aussi, et deux vides consécutives disent la fin du stock. Avant la règle du
-    # 2026-11-28, une page vide valait troncature et une reprise arrivée au bout
-    # se lisait comme une lecture courte.
     browser = FakeBrowser(EMPTY_PAGE)
 
     result = run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 2,
@@ -387,107 +382,7 @@ def test_une_reprise_au_dela_du_stock_rend_une_reponse_vide_et_pas_une_erreur():
 
     assert result["vehicles"] == []
     assert result["pages_read"] == 0
-    # La page 3, puis la sonde de la 4 : une seule ne suffit pas à conclure.
-    assert len(browser.opened) == 2
-    assert result["partial"] is False
-
-
-# --- Pagination : une page vide n'est pas la fin du marché -------------------
-
-def test_une_page_vide_fait_sonder_la_suivante_et_ses_annonces_sont_rendues():
-    # Mesuré le 2026-11-28 sur le site : la page 22 a rendu 23 annonces au
-    # premier chargement puis 0 au suivant, alors que la 23 en portait 19.
-    # S'arrêter sur la première vide coupait la récolte au milieu du stock.
-    browser = FakeBrowser(
-        fixture("search_fr.html"), EMPTY_PAGE, fixture("search_end_of_stock.html")
-    )
-
-    result = run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 3,
-                                      browser_factory=session(browser)))
-
-    urls = [vehicle["url"] for vehicle in result["vehicles"]]
-    assert "https://www.lacentrale.fr/auto-occasion-annonce-69116060.html" in urls
-    # La page vide ne rend aucune annonce et n'avance pas `pages_read`, qui reste
-    # la dernière page PORTANT des cartes.
-    assert len(result["vehicles"]) == 4
-    assert result["pages_read"] == 3
-    assert len(browser.opened) == 3
-
-
-def test_deux_pages_vides_consecutives_arretent_la_lecture_sans_la_dire_partielle():
-    # Deux vides d'affilée : la fin du stock est atteinte, donc `partial` est
-    # faux. La page 4 porte des cartes et ne doit PAS être demandée — c'est la
-    # seconde vide, pas la première, qui conclut.
-    browser = FakeBrowser(
-        fixture("search_end_of_stock.html"), EMPTY_PAGE, EMPTY_PAGE,
-        fixture("search_fr.html"),
-    )
-
-    result = run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 4,
-                                      browser_factory=session(browser)))
-
-    assert len(browser.opened) == 3
-    assert result["announced_total"] == 1
-    assert len(result["vehicles"]) == 1
-    assert result["pages_read"] == 1
-    assert result["partial"] is False
-
-
-def test_une_fin_de_stock_sans_total_annonce_n_est_pas_declaree_partielle():
-    # Sans compteur du site, deux pages vides consécutives restent une fin de
-    # stock : `partial` faux. C'était l'inverse avant la règle du 2026-11-28 —
-    # une page vide valait troncature — donc une récolte allée au bout se lisait
-    # courte, et l'outil proposait une reprise qui n'avait rien à lire.
-    browser = FakeBrowser(PAGE_SANS_COMPTEUR, EMPTY_PAGE, EMPTY_PAGE)
-
-    result = run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 3,
-                                      browser_factory=session(browser)))
-
-    assert result["announced_total"] is None
-    assert len(result["vehicles"]) == 1
-    assert result["partial"] is False
-
-
-def test_une_page_pleine_remet_le_compte_des_vides_a_zero():
-    # Deux vides SÉPARÉS par une page pleine ne sont pas deux vides consécutives :
-    # sans remise à zéro, la lecture s'arrêterait à la page 4 et perdrait la 5.
-    browser = FakeBrowser(
-        fixture("search_end_of_stock.html"), EMPTY_PAGE,
-        fixture("search_fr.html"), EMPTY_PAGE, fixture("search_fr.html"),
-    )
-
-    result = run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 5,
-                                      browser_factory=session(browser)))
-
-    assert len(browser.opened) == 5
-    assert result["pages_read"] == 5
-
-
-def test_le_delai_des_pages_suivantes_vaut_dix_secondes():
-    # Mesuré le 2026-11-28 : une page qui rend ses cartes le fait en 1 à 4 s, et
-    # une page vide coûtait 25,2 / 25,4 / 25,4 s d'attente. À ce prix, deux vides
-    # consécutifs (50 s) plus le lancement du navigateur (~20 s) dépassaient le
-    # délai du client MCP (~60 s) : d'où les `Request timed out`, et aucun réessai
-    # possible dans le budget. La constante est LUE depuis le module, pas
-    # recopiée depuis le commentaire qui l'explique.
-    assert sidecar.NEXT_PAGE_TIMEOUT_S == 10.0
-    # La première page garde son délai long : elle paie la résolution DataDome.
-    assert sidecar.FIRST_PAGE_TIMEOUT_S > sidecar.NEXT_PAGE_TIMEOUT_S
-
-
-def test_chaque_page_attend_le_delai_de_son_rang(monkeypatch):
-    # Un `_paginate` qui recopierait « 15 » ou « 10000 » en dur ne suivrait pas
-    # ces deux constantes, et c'est précisément l'écart (délai trop long, donc
-    # aucun réessai tenable dans le budget du client) que la mesure a mis au
-    # jour.
-    monkeypatch.setattr(sidecar, "FIRST_PAGE_TIMEOUT_S", 7.5)
-    monkeypatch.setattr(sidecar, "NEXT_PAGE_TIMEOUT_S", 3.5)
-    browser = FakeBrowser(fixture("search_fr.html"), fixture("search_fr.html"))
-
-    run(sidecar.scrape_pages("https://www.lacentrale.fr/listing", 2,
-                             browser_factory=session(browser)))
-
-    assert [page.waits for page in browser.opened] == [[7500.0], [3500.0]]
+    assert result["partial"] is True
 
 
 def test_un_defi_sur_la_premiere_page_lue_d_une_reprise_leve_challenge():
@@ -516,17 +411,6 @@ _VOID_TAGS = {"img", "br", "input", "meta", "link", "hr", "source"}
 EMPTY_PAGE = (
     "<html><head><title>Voiture occasion - La Centrale</title></head>"
     "<body></body></html>"
-)
-# Une page qui porte UNE carte et AUCUN compteur du site : le cas où la fin du
-# stock ne peut pas être prouvée par `announced_total`. Écrite à la main plutôt
-# que fixture, parce qu'une capture réelle porte toujours son compteur.
-PAGE_SANS_COMPTEUR = (
-    "<html><head><title>Voiture occasion - La Centrale</title></head><body>"
-    '<a href="/auto-occasion-annonce-69116070.html">'
-    '<h2 class="vehiclecardV2_title__vc1e9">PEUGEOT 208</h2>'
-    '<div class="vehiclecardV2_subTitle__c8h4X">1.2 PURETECH 100</div>'
-    '<div class="vehiclePrice__En33S">13&nbsp;690&nbsp;&euro;</div>'
-    "</a></body></html>"
 )
 
 
@@ -621,16 +505,12 @@ class FakePage(FakeElement):
         super().__init__(Node("#document"))
         self._pages_html = list(pages_html)
         self.visited: list[str] = []
-        # Délais d'attente demandés à chaque navigation, en millisecondes : ce
-        # que `_paginate` applique vraiment, par opposition à la constante citée.
-        self.waits: list[float] = []
 
     async def goto(self, url: str, wait_until: str | None = None) -> None:
         self.visited.append(url)
         self.node = tree(self._pages_html.pop(0) if self._pages_html else EMPTY_PAGE)
 
     async def wait_for_selector(self, selector: str, timeout: float | None = None):
-        self.waits.append(timeout)
         return await self.query_selector(selector)
 
     async def title(self) -> str:

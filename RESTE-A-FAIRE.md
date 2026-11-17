@@ -65,40 +65,38 @@ le site s'arrêtant de lui-même par une page vide), `MAX_PAGES_ANY` pour la bor
 d'un appel multi-sources, et le message nomme les sources et leurs plafonds.
 `pages_max=21` est donc accepté pour LaCentrale et refusé pour AutoScout24.
 
-### Pourquoi une reprise au-delà de la page 20 expire — mesuré le 2026-11-28
+### Pages 20+ de LaCentrale : diagnostic arrêté le 2026-11-28 (correctif ANNULÉ)
 
-Sonde Camoufox directe sur `?page=N` (recherche Yaris hybride, 524 annoncées) :
+Mesures, dans l'ordre où elles ont été faites :
 
-| page | annonces rendues | remarque |
-|---|---|---|
-| 21 | 24 | **aucune en commun avec la page 20** |
-| 22 | 23 | puis **0** au chargement suivant |
-| 23 | 19 | dernière page |
-| 24, 25, 30, 40 | **0** | fin réelle du stock |
+1. Sonde Camoufox directe, en passant **d'abord par la page 1** : pages 21 (24
+   annonces), 22 (23), 23 (19), 24+ vides. Le site a donc bien **23 pages**.
+2. Même sonde, une page rechargée deux fois : la page 22 a rendu 23 annonces,
+   puis **0** — intermittent, et une page vide coûte **25 s** d'attente.
+3. Chaîne réelle `harvest` + `resume` : progresse jusqu'à **441/524** puis
+   n'avance plus (pages_max 21, 24, 27 rendent tous 441 en 60–120 s).
+4. Side-car interrogé **directement** sur `start_page` 20, 22, 23 : **409 défi
+   anti-robot** à chaque fois, après ~76 s.
 
-Trois faits, dans l'ordre d'importance :
+Lecture retenue : **une reprise qui attaque une page profonde à froid se fait
+challenger** (pas de session ouverte, l'entrée profonde est directe) ; les sondes
+qui marchaient passaient d'abord par la page 1. Et il n'est pas exclu que la
+campagne de mesure elle-même (une quinzaine de récoltes en une heure) ait
+déclenché un durcissement — auquel cas le mur à 441 n'était pas structurel.
 
-1. **Le site ne s'arrête pas à 20 pages** : il en a 23 pour cette recherche. Le
-   blocage n'était donc pas le plafond.
-2. **La page est INTERMITTENTE** : la page 22 a rendu 23 annonces une fois, 0 la
-   fois suivante. Or une page qui ne rend rien coûte **25 s d'attente** (mesuré :
-   25,2 s / 25,4 s / 25,4 s sur les pages 22, 24, 25). Demander 5 pages dont 2
-   vides = 50 s d'attente pure + ~20 s de lancement de navigateur → au-delà du
-   délai du client MCP (~60 s). **C'est la vraie cause des `Request timed out`**,
-   pas le plafond de pages.
-3. **Une page vide est aujourd'hui lue comme « fin du marché »**, et c'est faux
-   sur ce site : une page 22 vide alors que la 23 contient 19 annonces coupe la
-   récolte. Les **441 / 524** mesurés peuvent donc être sous-estimés, en plus de
-   l'effet du plafond.
+**Le correctif de pagination a été annulé** : il coûtait deux pages sondées et
+10 s d'attente sans rien apporter (441 avant comme après) — c'est l'usine à gaz
+qu'on refusé. `n_distinct` (lot B) est conservé et fonctionne.
 
-Ce qui reste à faire (aucun code touché) :
-
-- **réessayer une fois** une page qui rend zéro avant de conclure à la fin ;
-- **ne pas s'arrêter sur la première page vide** : sonder la suivante, et
-  n'arrêter qu'après deux vides consécutifs ;
-- garder `?page=N` (la forme `/listing/p-N.html` n'existe plus : erreur de
-  navigation, mesuré) ;
-- le plafond LaCentrale à 30 est cohérent avec 23 pages réelles.
+Pour reprendre, dans cet ordre :
+1. Ne rien mesurer pendant 24-48 h sur LaCentrale : si c'est du rate-limiting,
+   le laisser retomber.
+2. Rejouer la chaîne une fois, calmement. Si 441 revient, c'est structurel.
+3. Si c'est structurel : **réchauffer la session** (naviguer la page 1, jeter ses
+   annonces, puis attaquer `start_page`) — c'est le seul levier que la mesure 4
+   désigne, et il ne coûte qu'une navigation.
+4. Ne PAS réintroduire la sonde « deux pages vides consécutives » sans preuve
+   qu'elle lit plus : mesuré, elle coûte et ne lit rien de plus.
 
 **Contrainte de pas, mesurée après coup** : une reprise relance le navigateur
 (~20 s) puis lit ~8 s par page. `pages_max=2` puis `resume` avec `pages_max=6` a

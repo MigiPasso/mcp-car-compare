@@ -44,13 +44,7 @@ supposition mettrait une adresse inventée dans une comparaison de prix.
   mesuré dans ICH ;
 - 60 s au moins entre deux LANCEMENTS de navigateur (`LAUNCH_INTERVAL_S`) : le
   site le supporte mal autrement, et deux navigateurs simultanés sur la même IP
-  ne vont pas plus vite ;
-- **une page vide n'est PAS la fin du marché.** Mesuré le 2026-11-28 (sonde
-  Camoufox directe, `?page=N`, recherche Yaris) : la page 22 a rendu 23 annonces
-  au premier chargement puis 0 au suivant, alors que la 23 en portait 19. Le
-  trou observé fait exactement une page, donc une page vide fait sonder la
-  suivante et deux vides CONSÉCUTIVES concluent la fin du stock
-  (`CONSECUTIVE_EMPTY_PAGES_TO_STOP`).
+  ne vont pas plus vite.
 """
 
 from __future__ import annotations
@@ -91,14 +85,8 @@ LAUNCH_INTERVAL_S = 60.0
 FIRST_PAGE_TIMEOUT_S = 75.0
 
 # Délai des pages suivantes : la session est déjà ouverte et le défi déjà
-# résolu. Mesuré le 2026-11-28 (sonde Camoufox directe, `?page=N` sur une
-# recherche Yaris) : une page qui rend ses cartes le fait en 1 à 4 s, et une
-# page qui n'en rend aucune coûtait 25,2 / 25,4 / 25,4 s d'attente. 25 s est six
-# fois le rendu observé, et à ce prix deux vides consécutifs (50 s) plus le
-# lancement du navigateur (~20 s) dépassaient le délai du client MCP (~60 s),
-# d'où les `Request timed out`. 10 s laisse deux fois le rendu observé et fait
-# tenir dans ce délai les deux pages vides que le sondage peut coûter.
-NEXT_PAGE_TIMEOUT_S = 10.0
+# résolu, une page qui ne rend rien en 15 s ne rendra rien.
+NEXT_PAGE_TIMEOUT_S = 15.0
 
 # Délai interne d'une requête entière, lancement du navigateur compris. Il est
 # testé ENTRE deux pages et jamais pendant une attente de cartes : une page qui
@@ -121,13 +109,6 @@ REQUEST_TIMEOUT_S = 180.0
 # c'est cette observation qui tranche, pas cette constante.
 MAX_PAGES_CAP = 40
 PAGINATION_PARAM = "page"
-
-# Nombre de pages vides CONSÉCUTIVES qui concluent la fin du stock. Une seule ne
-# suffit pas : mesuré le 2026-11-28, la page 22 de LaCentrale a rendu 23 annonces
-# au premier chargement puis 0 au suivant, alors que la 23 en portait 19 — le
-# trou fait exactement une page. S'arrêter sur la première vide coupait donc la
-# récolte au milieu du stock.
-CONSECUTIVE_EMPTY_PAGES_TO_STOP = 2
 
 # Page de départ quand l'appelant ne s'en prononce pas : le début.
 FIRST_PAGE = 1
@@ -653,14 +634,6 @@ async def _paginate(
     délai long, et le refus d'un résultat vide. La comparer à `1` en dur
     rendrait une reprise à la page 5 sans attente de cartes et sans refus, donc
     silencieusement vide.
-
-    Une page vide ne termine plus la lecture (`CONSECUTIVE_EMPTY_PAGES_TO_STOP`) :
-    elle est comptée comme lue à zéro — aucune annonce rendue, et `pages_read`
-    n'avance pas, il reste la dernière page PORTANT des cartes, donc une sonde ne
-    le gonfle jamais. `partial` reste l'aveu de ce qui manque : faux quand la
-    lecture s'arrête sur une page vide, parce que c'est la fin du stock ; vrai
-    quand le plafond a coupé, quand un défi a interrompu, ou quand le site
-    annonce plus d'annonces que la lecture n'en a rendu.
     """
     started = _clock()
     vehicles: list[dict] = []
@@ -668,10 +641,6 @@ async def _paginate(
     announced_total: int | None = None
     pages_read = 0
     partial = False
-    # Pages vides d'affilée. Remis à zéro par toute page qui porte des cartes :
-    # sans cela, deux vides SÉPARÉS par une page pleine compteraient comme
-    # consécutifs et arrêteraient la lecture au milieu du stock.
-    empty_pages = 0
     first_read = max(FIRST_PAGE, start_page)
     # Le plafond du side-car borne la lecture ABSOLUE, pas le nombre de pages de
     # la requête : sans lui, `start_page=19&max_pages=20` demanderait 39 pages
@@ -712,32 +681,17 @@ async def _paginate(
                         "la page 1 n'a rendu aucune carte et n'est pas un défi : "
                         "structure changée ou adresse sans résultat"
                     )
-                # Une page sans carte n'est la fin du stock qu'après la page
-                # SUIVANTE : mesuré le 2026-11-28, la 22 a rendu 23 annonces
-                # puis 0, alors que la 23 en portait 19. La page vide reste donc
-                # comptée comme lue à zéro (aucune annonce, `pages_read`
-                # inchangé) et la suivante est sondée une fois ; c'est deux
-                # vides CONSÉCUTIVES qui disent la fin.
+                # Une page sans carte n'est la fin du stock que si le site
+                # n'annonçait pas davantage. Sinon (page trop lente, paramètre
+                # de pagination ignoré) la lecture est courte, et le dire évite
+                # de faire passer un marché tronqué pour un marché complet.
                 #
-                # À partir d'une page de reprise, une page vide est aussi le cas
-                # NORMAL du stock qui s'arrête avant la page demandée.
-                empty_pages += 1
-                if empty_pages < CONSECUTIVE_EMPTY_PAGES_TO_STOP:
-                    LOGGER.info("page %d sans carte : sonde de la page suivante", number)
-                    continue
-                # Deux vides d'affilée : la lecture a atteint la fin du stock,
-                # donc elle n'est PAS tronquée. Le seul aveu qui reste est celui
-                # du site — s'il annonce plus d'annonces qu'il n'en a rendu, il
-                # se contredit, et « je m'arrête sans avoir ce qu'il annonce » ne
-                # doit pas se lire comme un marché complet.
-                if announced_total is not None and len(vehicles) < announced_total:
+                # À partir d'une page de reprise, une page vide est un cas
+                # NORMAL : le stock peut s'arrêter avant la page demandée.
+                if announced_total is None or len(vehicles) < announced_total:
                     partial = True
-                LOGGER.info(
-                    "pages %d et %d sans carte : fin du stock après %d annonce(s)",
-                    number - 1, number, len(vehicles),
-                )
+                LOGGER.warning("page %d sans carte : lecture partielle", number)
                 break
-            empty_pages = 0
             # Recouvrement entre deux pages : la carte mise en avant revient en
             # tête de chaque page, et une annonce peut chevaucher deux pages.
             # La PREMIÈRE lecture gagne, donc l'ordre du site est préservé.
