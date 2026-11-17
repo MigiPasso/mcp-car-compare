@@ -29,6 +29,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -54,6 +55,7 @@ from .models import (
     SOURCES,
     SORTS,
     Criteria,
+    CorpusAge,
     Listing,
     Source,
     SourceCoverage,
@@ -70,6 +72,13 @@ HTTP_TIMEOUT_S = 30.0
 # Une page plus grande ne sert personne : le canal MCP transporte du JSON, et
 # 100 annonces font déjà ~30 Ko.
 MAX_LIMIT = 100
+
+# Âge au-delà duquel le corpus daté n'est plus tout à fait le marché du jour :
+# une annonce vue il y a plus d'une semaine a de bonnes chances d'être vendue,
+# et une médiane calculée dessus décrit des voitures qui ne sont peut-être plus
+# à vendre. Seuil de LECTURE, pas de rétention : rien n'est purgé (TODO.md §3),
+# on date ce qu'on a lu et on le dit.
+STALE_CORPUS_DAYS = 7
 
 # Le périmètre des sources n'est pas réécrit ici : `models.SERVED_SOURCES` en
 # est la seule déclaration, et ce module la lit.
@@ -295,6 +304,23 @@ def register(
         `coverage` décrit le corpus (annonces distinctes, récoltes, et par source
         l'état de sa récolte), jamais la somme des récoltes.
 
+        **`corpus_age`** date ce corpus, à côté de `coverage` et non dedans :
+        `{oldest_seen, newest_seen}`, les bornes de la dernière vue des annonces
+        de la récolte (ISO-8601 UTC). **Deux `null` veut dire « aucune annonce
+        datée »** — corpus vide, OU annonces écrites avant l'existence de la
+        colonne : une base migrée rend `null`/`null` alors que `coverage`
+        compte des annonces, et c'est `coverage.listings_distinct` qui sépare
+        les deux cas. Aucun avertissement de fraîcheur ne peut alors parler, et
+        ce silence est la limite de ce que l'âge sait dire. Il porte
+        sur la récolte entière, pas sur la page rendue : `coverage` décrit déjà
+        la récolte, et deux blocs qui ne parleraient pas du même objet se
+        contrediraient d'une page à l'autre. **Une annonce vue il y a plus de
+        sept jours peut être vendue** : `oldest_seen` le dit, `offers` n'ajoute
+        pas de `warnings` — c'est à l'appelant de ne pas la présenter comme
+        disponible. **Au-delà de sept jours, la plus
+        ancienne peut être vendue** : le vérifier avant de présenter une annonce
+        comme disponible — rien n'est purgé, l'âge est dit.
+
         Limite résiduelle assumée : l'offset désigne une position dans un tri
         total, pas un instantané. Un `INSERT OR REPLACE` (une annonce revue entre
         deux pages, avec un prix à jour) peut déplacer une annonce d'un rang et
@@ -355,6 +381,7 @@ def register(
         with Store(_read_only_corpus_path(db_path)) as store:
             job = store.job(job_id)
             corpus = store.corpus(job_id)
+            corpus_age = store.job_corpus_age(job_id)
             offset = 0
             if cursor is not None:
                 position = cursor_module.decode(cursor)
@@ -417,12 +444,13 @@ def register(
                 # la main en deux endroits.
                 "has_more": has_more,
                 "coverage": corpus.as_dict(),
+                "corpus_age": corpus_age.as_dict(),
             }
 
     @mcp.tool()
     def analyze_models(criteria: dict, limit: int = 30) -> dict:
         """Agrégats par modèle sur le corpus déjà récolté (30 groupes par défaut,
-        100 au plus) : `{criteria, groups, groups_total, coverage,
+        100 au plus) : `{criteria, groups, groups_total, coverage, corpus_age,
         warnings}`.
 
         **Le groupe est `(make, group)`**, pas le libellé : `group` est la clé de
@@ -487,6 +515,19 @@ def register(
         écrite) ; `criteria` dit à part ce qui a filtré. `groups_total` compte
         tous les groupes correspondants, pas seulement ceux que `limit` rend :
         c'est la différence entre « 30 groupes » et « 30 sur 87 ».
+
+        **Une médiane n'est pas « le marché » : elle a un âge, et il est dit.**
+        `corpus_age` date les annonces que les critères retiennent
+        (`oldest_seen`, `newest_seen`, ISO-8601 UTC) — pas la base entière, dont
+        l'âge ne dirait rien des prix analysés. **Deux `null` veut dire « aucune
+        annonce datée »** : corpus vide, ou base migrée dont les annonces
+        existantes n'ont pas de date — et dans ce second cas `coverage` compte
+        des annonces que l'âge ne couvre pas, donc aucun `warning` de fraîcheur
+        ne se déclenche. C'est une limite, pas une affirmation de fraîcheur.
+        Au-delà de sept jours, un `warning` le dit en jours : les
+        annonces du corpus peuvent être vendues, et une distribution porte alors
+        sur des voitures qui ne sont plus à vendre. Rien n'est purgé, aucune
+        ancienneté n'est corrigée : l'âge est rendu à côté des chiffres.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
             raise ValueError(f"limit doit être un entier de 1 à {MAX_LIMIT}")
@@ -502,6 +543,7 @@ def register(
             )
             unmatched = store.unmatched_filters(listing_filter)
             coverage = store.whole_corpus()
+            corpus_age = store.filtered_corpus_age(listing_filter)
         rendered: list[dict] = []
         warnings: list[str] = []
         for miss in unmatched:
@@ -512,6 +554,11 @@ def register(
                 f"{miss.key}={miss.value!r} : aucune annonce ne correspond ; "
                 f"valeurs présentes dans le corpus : {present}"
             )
+        # L'avertissement de fraîcheur vient après les critères fautifs et avant
+        # les groupes : il qualifie la réponse entière, pas un groupe.
+        stale = _stale_corpus_warning(corpus_age, now=datetime.now(timezone.utc))
+        if stale is not None:
+            warnings.append(stale)
         for group in groups:
             prices = series[(group.make_key, group.group_key)]
             # Le compte des voitures distinctes EST la longueur de la série :
@@ -557,8 +604,34 @@ def register(
             "groups": rendered,
             "groups_total": groups_total,
             "coverage": coverage.as_dict(),
+            "corpus_age": corpus_age.as_dict(),
             "warnings": warnings,
         }
+
+
+def _stale_corpus_warning(corpus_age: CorpusAge, *, now: datetime) -> str | None:
+    """La phrase qui date un corpus trop vieux, ou `None` quand il est frais.
+
+    Le seuil est écrit une seule fois (`STALE_CORPUS_DAYS`) et comparé en JOURS
+    ENTIERS révolus (`timedelta.days`), parce que c'est l'unité que la phrase
+    cite : sept jours pleins sont signalés, six jours et vingt-trois heures ne le
+    sont pas. Le nombre de jours annoncé est donc celui qui a réellement été
+    mesuré, jamais un arrondi.
+
+    `None` aussi quand `oldest_seen` est `None` : un corpus sans date ne dit pas
+    qu'il est frais, il ne dit rien — et c'est `corpus_age` qui porte ce silence
+    sous forme de deux `null`.
+    """
+    if corpus_age.oldest_seen is None:
+        return None
+    days = (now - datetime.fromisoformat(corpus_age.oldest_seen)).days
+    if days < STALE_CORPUS_DAYS:
+        return None
+    return (
+        f"la plus ancienne annonce du corpus a été vue il y a {days} jour(s) : "
+        "des voitures peuvent être vendues depuis, et les chiffres portent donc sur "
+        "des annonces qui ne sont peut-être plus disponibles"
+    )
 
 
 def _truncation_warnings(

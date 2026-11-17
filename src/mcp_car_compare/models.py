@@ -338,6 +338,35 @@ class CorpusCoverage:
         return asdict(self)
 
 
+@dataclass(slots=True)
+class CorpusAge:
+    """L'âge du corpus qui a SERVI une réponse : ses deux bornes de vue.
+
+    `last_seen_at` est la date de la dernière **écriture** d'une annonce dans le
+    corpus (ISO-8601 UTC). Une annonce jamais revue garde la date de sa dernière
+    écriture — c'est bien cet âge-là qui compte, une annonce non revue étant
+    aussi une annonce peut-être vendue. **Une annonce revue par une récolte
+    reprise n'est pas réécrite** (elle est écartée comme déjà vue), donc sa date
+    est celle de la première récolte qui l'a écrite : l'âge est surestimé, jamais
+    sous-estimé, et le sens de l'erreur est celui du doute.
+
+    Le bloc date le corpus de la RÉPONSE, jamais la base entière : les annonces
+    de la récolte pour `offers`, celles que les critères retiennent pour
+    `analyze_models`. Il vit à côté de `coverage`, pas dedans : `coverage`
+    compte, `corpus_age` date, et la forme de `coverage` est partagée par deux
+    outils.
+
+    Deux `None` veut dire « aucune annonce datée » — corpus vide, ou base migrée
+    dont les annonces précédent la colonne. Le bloc n'est jamais absent.
+    """
+
+    oldest_seen: str | None = None
+    newest_seen: str | None = None
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
 class Source(Protocol):
     """Interface que chaque adaptateur de source doit satisfaire.
 

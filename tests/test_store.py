@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,46 @@ def test_reading_a_listing_again_updates_it_instead_of_duplicating(tmp_path):
         store.add_page("job-1", [listing("1", price=9_000)])
         items, _ = store.page("job-1", sort="price_asc", offset=0, limit=10)
         assert [item.price for item in items] == [9_000, 11_000]
+
+
+# --- âge du corpus ------------------------------------------------------------
+
+# Deux dates fixes, injectées : aucune assertion ne dépend de l'heure réelle et
+# aucun test ne dort. Le format attendu est ÉCRIT EN CLAIR (`+00:00`, six
+# chiffres de microsecondes) : c'est la forme que `MIN`/`MAX` de SQLite
+# comparent, donc une forme qui change se voit ici.
+FIRST_SEEN = datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc)
+LATER_SEEN = datetime(2026, 11, 3, 18, 30, tzinfo=timezone.utc)
+
+
+def test_relire_une_annonce_rafraichit_sa_derniere_vue(tmp_path):
+    # `listings` n'avait aucune date : une médiane présentait des récoltes
+    # d'âges inconnus comme « le marché ». La colonne est posée à l'écriture, donc
+    # revoir une annonce la RAFRAÎCHIT — et l'annonce jamais revue garde sa date,
+    # ce qui est exactement l'âge qu'on veut mesurer.
+    path = tmp_path / "corpus.db"
+    with Store(path, now=lambda: FIRST_SEEN) as store:
+        store.add_page("job-1", [listing("1"), listing("2")])
+    with Store(path, now=lambda: LATER_SEEN) as store:
+        store.add_page("job-2", [listing("1")])
+    with Store(path) as store:
+        # Les deux bornes de la récolte initiale disent les deux moitiés :
+        # `oldest_seen` reste le 1er parce que l'annonce "2", JAMAIS revue,
+        # garde la date de sa dernière vue ; `newest_seen` a bougé au 3 parce que
+        # l'annonce "1" a été rafraîchie. La ligne de `listings` est unique par
+        # identité, donc le rafraîchissement vaut pour toutes les récoltes qui
+        # citent cette annonce — c'est la même annonce, vue plus récemment.
+        assert store.job_corpus_age("job-1").as_dict() == {
+            "oldest_seen": "2026-11-01T09:00:00.000000+00:00",
+            "newest_seen": "2026-11-03T18:30:00.000000+00:00",
+        }
+        # La récolte qui a revu l'annonce ne porte que la vue fraîche.
+        assert store.job_corpus_age("job-2").as_dict() == {
+            "oldest_seen": "2026-11-03T18:30:00.000000+00:00",
+            "newest_seen": "2026-11-03T18:30:00.000000+00:00",
+        }
+        # Et la relier n'a pas créé une seconde ligne : la clé d'identité tient.
+        assert store.corpus("job-1").listings_distinct == 2
 
 
 def test_a_listing_read_by_two_harvests_belongs_to_both(tmp_path):
@@ -452,7 +493,12 @@ CREATE TABLE "run_listings" (
 
 
 def previous_corpus(path) -> None:
-    """Écrit un corpus dans le schéma d'avant, avec une récolte déjà dedans."""
+    """Écrit un corpus dans le schéma d'avant, avec une récolte et une annonce
+    déjà dedans.
+
+    L'annonce compte : la migration de `last_seen_at` porte sur `listings`, et
+    une table vide ne distinguerait pas « colonne ajoutée » de « rien à dater ».
+    """
     connection = sqlite3.connect(str(path))
     with connection:
         connection.executescript(PREVIOUS_SCHEMA)
@@ -460,6 +506,16 @@ def previous_corpus(path) -> None:
             'INSERT INTO "runs" ("job_id", "source", "market", "status", "read", "unique", '
             '"dropped_duplicates", "criteria_hash", "sort") '
             "VALUES ('job-1', 'autoscout24', 'fr', 'ok', 20, 18, 2, 'h', 'price_asc')"
+        )
+        connection.execute(
+            'INSERT INTO "listings" ("source", "market", "source_id", "url", "make", '
+            '"group", "group_label", "year", "km", "price") '
+            "VALUES ('autoscout24', 'fr', '1', 'https://example.test/1', 'Renault', "
+            "'clio', 'Clio', 2021, 48000, 10000)"
+        )
+        connection.execute(
+            'INSERT INTO "run_listings" ("job_id", "source", "market", "source_id") '
+            "VALUES ('job-1', 'autoscout24', 'fr', '1')"
         )
     connection.close()
 
@@ -488,6 +544,35 @@ def test_une_base_de_la_version_precedente_est_migree_a_l_ouverture(tmp_path):
             "job-1", run(market="de", read=1, unique=1), criteria_hash="h", sort="price_asc"
         )
         assert [row["market"] for row in store.corpus("job-1").sources] == ["de", "fr"]
+
+
+def test_la_colonne_last_seen_at_est_ajoutee_et_les_annonces_existantes_restent_nulles(
+    tmp_path,
+):
+    # Une base écrite avant la colonne n'a aucune date : l'annonce qui y est déjà
+    # n'en reçoit pas. Une date inventée à la migration se lirait comme une
+    # mesure, et « vue aujourd'hui » est le contraire de ce que ce corpus-là sait.
+    path = tmp_path / "corpus.db"
+    previous_corpus(path)
+
+    with Store(path) as store:
+        assert store.job_corpus_age("job-1").as_dict() == {
+            "oldest_seen": None,
+            "newest_seen": None,
+        }
+        # La colonne est bien là, et nulle : un `ALTER TABLE` qui aurait posé un
+        # défaut (`CURRENT_TIMESTAMP`) donnerait une date ici.
+        rows = store._conn.execute(
+            'SELECT "source_id", "last_seen_at" FROM "listings"'
+        ).fetchall()
+        assert [(row[0], row[1]) for row in rows] == [("1", None)]
+        # Écrire après migration est le geste que la migration existe pour
+        # rendre possible : l'annonce relue porte une date, l'ancienne non.
+        store.add_page("job-1", [listing("2")])
+        dated = store._conn.execute(
+            'SELECT "source_id", "last_seen_at" IS NULL FROM "listings" ORDER BY "source_id"'
+        ).fetchall()
+        assert [(row[0], row[1]) for row in dated] == [("1", 1), ("2", 0)]
 
 
 def test_la_migration_est_idempotente(tmp_path):
@@ -531,3 +616,19 @@ def test_the_corpus_survives_a_reopening(tmp_path):
         items, _ = store.page("job-1", sort="price_asc", offset=0, limit=10)
         assert [item.source_id for item in items] == ["1"]
         assert store.corpus("job-1").listings_distinct == 1
+
+
+def test_une_date_naive_injectee_est_lue_comme_utc(tmp_path):
+    # `datetime.astimezone()` interprète un datetime NAÏF comme heure LOCALE de
+    # la machine. La couture `now` est ouverte aux tests : sans cette garde, le
+    # même test passerait en UTC (le conteneur) et rougirait sur une machine à
+    # TZ=Europe/Paris — un test qui dépend de l'hôte. Une date naïve est donc
+    # lue comme UTC, et le stockage ne bouge plus d'un fuseau à l'autre.
+    path = tmp_path / "corpus.db"
+    with Store(path, now=lambda: datetime(2026, 11, 1, 9, 0)) as store:
+        store.add_page("job-1", [listing("1")])
+    with Store(path) as store:
+        assert store.job_corpus_age("job-1").as_dict() == {
+            "oldest_seen": "2026-11-01T09:00:00.000000+00:00",
+            "newest_seen": "2026-11-01T09:00:00.000000+00:00",
+        }

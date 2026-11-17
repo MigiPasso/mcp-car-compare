@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import sqlite3
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .models import CorpusCoverage, Listing, SourceCoverage, price_is_plausible
+from .models import CorpusAge, CorpusCoverage, Listing, SourceCoverage, price_is_plausible
 
 # BUSY_TIMEOUT_MS est le temps qu'une écriture attend un verrou tenu par une
 # autre connexion avant de rendre `database is locked`. Sans lui, un `offers`
@@ -37,6 +38,30 @@ BUSY_TIMEOUT_MS = 5000
 # reconnaître un vocabulaire, assez peu pour ne pas noyer la réponse.
 _SAMPLE_VALUES = 5
 
+
+def _utc_now() -> datetime:
+    """L'heure courante en UTC : la seule horloge du corpus."""
+    return datetime.now(timezone.utc)
+
+
+def _timestamp(moment: datetime) -> str:
+    """Un horodatage ISO-8601 UTC à largeur FIXE (`2026-11-01T09:00:00.000000+00:00`).
+
+    La largeur fixe n'est pas décorative : `MIN`/`MAX` de SQLite comparent des
+    chaînes, et un `isoformat()` qui omettrait les microsecondes quand elles sont
+    nulles (`timespec="auto"`) produirait deux largeurs pour une même date. Les
+    bornes rendues par `job_corpus_age` se liraient alors dans un ordre qui
+    n'est plus le temps.
+    """
+    # Un `datetime` naïf serait interprété en heure LOCALE de l'hôte par
+    # `astimezone()` : le même test passerait en UTC (conteneur) et rougirait
+    # sur une machine à `TZ=Europe/Paris`. La couture `now` est ouverte aux
+    # tests ; on ne peut pas compter sur leur vigilance pour le fuseau.
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 # Un tri par corpus doit être total, sinon deux pages successives peuvent
 # répéter ou sauter une annonce : `(source, market, source_id)` départage
 # toujours. Les prix et années inconnus passent en dernier (ils ne sont pas
@@ -47,6 +72,10 @@ _ORDER_BY = {
     "age_desc": 'l."year" IS NULL, l."year" DESC, l."source", l."market", l."source_id"',
 }
 
+# Les colonnes qui reconstruisent un `Listing` à la lecture. `last_seen_at` n'y
+# est pas : le site ne la publie pas, c'est le corpus qui l'horodate, et
+# l'ajouter ici ferait sortir un champ d'horodatage dans `offers.items` — un
+# contrat que personne n'a demandé.
 _LISTING_COLUMNS = (
     "source",
     "market",
@@ -71,6 +100,11 @@ _LISTING_COLUMNS = (
     "vin",
 )
 
+# Ce qu'un `add_page` écrit : l'annonce telle que le site la rend, plus la date
+# de cette vue-ci. `INSERT OR REPLACE` réécrit la ligne entière, donc la date est
+# bien RAFRAÎCHIE quand la même annonce est revue.
+_LISTING_WRITE_COLUMNS = (*_LISTING_COLUMNS, "last_seen_at")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS "listings" (
     "source"        TEXT NOT NULL,
@@ -94,6 +128,12 @@ CREATE TABLE IF NOT EXISTS "listings" (
     "country"       TEXT NOT NULL DEFAULT '',
     "image"         TEXT NOT NULL DEFAULT '',
     "vin"           TEXT,
+    -- Date de la dernière VUE de cette annonce, en ISO-8601 UTC. Elle ne vient
+    -- pas du site : `Store.add_page` l'écrit à chaque passage, donc une annonce
+    -- revue est rafraîchie et une annonce jamais revue garde sa dernière vue.
+    -- NULL sur une base migrée (annonce écrite avant que la colonne existe) :
+    -- une date inventée se lirait comme une mesure.
+    "last_seen_at"  TEXT,
     PRIMARY KEY ("source", "market", "source_id")
 );
 
@@ -149,7 +189,13 @@ CREATE INDEX IF NOT EXISTS "idx_listings_cohort" ON "listings"(
 # version d'avant, et `write_run` échouerait sur l'INSERT (« table runs has no
 # column named dropped_invalid »). Une mise à jour casserait alors toute
 # récolte sur un corpus existant, sans que rien ne le signale avant l'appel.
-_ADDED_COLUMNS = (("runs", "dropped_invalid", "INTEGER NOT NULL DEFAULT 0"),)
+_ADDED_COLUMNS = (
+    ("runs", "dropped_invalid", "INTEGER NOT NULL DEFAULT 0"),
+    # Sans date, une médiane présentait des récoltes d'âges inconnus comme « le
+    # marché », voitures vendues comprises. La colonne est NULL sur les annonces
+    # déjà écrites : l'absence de mesure se dit, elle ne s'invente pas.
+    ("listings", "last_seen_at", "TEXT"),
+)
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
@@ -524,10 +570,17 @@ class MarketGap:
 
 
 class Store:
-    """Accès au corpus. S'ouvre en contexte : `with Store(path) as store: ...`."""
+    """Accès au corpus. S'ouvre en contexte : `with Store(path) as store: ...`.
 
-    def __init__(self, db_path: str | Path) -> None:
+    `now` est injectable pour les tests : `last_seen_at` est daté à l'écriture,
+    et un test qui doit vieillir un corpus n'a pas à dormir.
+    """
+
+    def __init__(
+        self, db_path: str | Path, *, now: Callable[[], datetime] = _utc_now
+    ) -> None:
         self.path = Path(db_path)
+        self._now = now
         if not self.path.parent.exists():
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
@@ -564,19 +617,30 @@ class Store:
 
         Revoir une annonce déjà connue la met à jour sans créer de ligne : le
         corpus ne compte que des annonces distinctes.
+
+        Chaque annonce écrite porte `last_seen_at`, la date de CETTE vue
+        (`self._now`, ISO-8601 UTC), et `INSERT OR REPLACE` la réécrit : une
+        annonce revue est donc rafraîchie, une annonce jamais revue garde la
+        date de sa dernière vue. C'est exactement ce que `corpus_age` mesure.
+
+        Une seule date par page : les annonces d'une même page ont été vues
+        ensemble, et deux lectures d'horloge dans la même page ne feraient que
+        suggérer une précision que la récolte n'a pas.
         """
-        columns = ", ".join(f'"{name}"' for name in _LISTING_COLUMNS)
-        placeholders = ", ".join("?" for _ in _LISTING_COLUMNS)
+        columns = ", ".join(f'"{name}"' for name in _LISTING_WRITE_COLUMNS)
+        placeholders = ", ".join("?" for _ in _LISTING_WRITE_COLUMNS)
         insert_listing = f'INSERT OR REPLACE INTO "listings" ({columns}) VALUES ({placeholders})'
         link_listing = (
             'INSERT OR IGNORE INTO "run_listings" '
             '("job_id", "source", "market", "source_id") VALUES (?, ?, ?, ?)'
         )
+        seen_at = _timestamp(self._now())
         with self._conn:
             for listing in listings:
                 fields = listing.as_dict()
                 self._conn.execute(
-                    insert_listing, tuple(fields[name] for name in _LISTING_COLUMNS)
+                    insert_listing,
+                    tuple(fields[name] for name in _LISTING_COLUMNS) + (seen_at,),
                 )
                 self._conn.execute(link_listing, (job_id,) + listing.key())
 
@@ -828,6 +892,53 @@ class Store:
                 for row in rows
             ],
         )
+
+    # --- âge du corpus ------------------------------------------------------
+
+    def job_corpus_age(self, job_id: str) -> CorpusAge:
+        """Les bornes de `last_seen_at` des annonces de CETTE récolte.
+
+        Le corpus de `offers`, c'est la récolte qu'il pagine : les bornes
+        décrivent donc l'ensemble des annonces de la récolte, pas la page
+        rendue. Une date par page changerait à chaque page alors que le corpus
+        ne change pas, et `coverage` décrit déjà le corpus de la récolte — les
+        deux blocs doivent parler du même objet. L'appelant qui veut l'âge d'une
+        annonce précise la retrouve dans `oldest_seen`/`newest_seen`.
+
+        `MIN`/`MAX` ignorent les `NULL` : une annonce écrite avant que la
+        colonne existe ne tire pas la borne vers une date inventée, elle
+        n'apparaît pas. Un corpus vide (ou entièrement non daté) rend deux
+        `None`.
+        """
+        row = self._conn.execute(
+            'SELECT MIN(l."last_seen_at") AS oldest, MAX(l."last_seen_at") AS newest '
+            'FROM "listings" AS l '
+            'JOIN "run_listings" AS rl ON rl."source" = l."source" '
+            'AND rl."market" = l."market" AND rl."source_id" = l."source_id" '
+            'WHERE rl."job_id" = ?',
+            (job_id,),
+        ).fetchone()
+        return CorpusAge(oldest_seen=row["oldest"], newest_seen=row["newest"])
+
+    def filtered_corpus_age(self, listing_filter: ListingFilter) -> CorpusAge:
+        """Les bornes de `last_seen_at` des annonces que ce filtre retient.
+
+        C'est le corpus qui a SERVI une analyse, pas la base entière : une
+        médiane de Clio porte sur les Clio du corpus, et dater la base
+        répondrait à côté — un corpus de Clio toutes fraîches et une base de
+        Golf de l'an dernier rendraient « un mois » sous une médiane qui n'a
+        qu'un jour. Le filtre est celui de `model_groups`, appliqué par le même
+        `_filter_parts` : les bornes et les comptes portent donc sur le même
+        ensemble d'annonces.
+        """
+        clause, params = _filter_clause(_filter_parts(listing_filter))
+        where = f"WHERE {clause}" if clause else ""
+        row = self._conn.execute(
+            'SELECT MIN(l."last_seen_at") AS oldest, MAX(l."last_seen_at") AS newest '
+            f'FROM "listings" AS l {where}',
+            params,
+        ).fetchone()
+        return CorpusAge(oldest_seen=row["oldest"], newest_seen=row["newest"])
 
     # --- analyse par modèle -------------------------------------------------
 
