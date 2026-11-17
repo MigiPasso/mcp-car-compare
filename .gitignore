@@ -18,3 +18,6 @@ __pycache__/
 /profile/
 .env
 .env.*
+
+# Captures de pages de sites tiers : jamais publiées (voir RESTE-A-FAIRE.md).
+tests/fixtures/

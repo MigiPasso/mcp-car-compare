@@ -47,6 +47,17 @@ from mcp_car_compare.sources.labels import (
 
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "autoscout24"
 
+# Les captures des sites ne sont PAS publiées dans le dépôt : ce sont des pages
+# entières d'un tiers, et l'opérateur ne veut pas les voir sur GitHub. Elles
+# restent sur la machine qui les a prises ; sans elles, le module entier est
+# sauté plutôt que faussement vert.
+if not FIXTURES.is_dir():
+    pytest.skip(
+        f"captures absentes ({FIXTURES.name}/ non publié) : lancer sur la machine qui les détient",
+        allow_module_level=True,
+    )
+
+
 
 def fixture(name: str) -> str:
     """Corps d'une page capturée."""
