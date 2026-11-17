@@ -169,6 +169,11 @@ def register(
         `market` n'est pas décoratif : les libellés de marque sont rendus dans la
         langue du marché, et c'est le libellé — pas l'identifiant `value` — que
         `harvest` attend dans `criteria.make`.
+
+        **Outil FACULTATIF** : `harvest` accepte directement un libellé (« Renault »,
+        « Série 3 »), donc rien n'oblige à l'appeler avant une recherche. Il rend
+        ~300 marques d'un coup (~20 Ko) : c'est de la découverte, à faire une fois
+        si l'on ne sait pas comment le site nomme une marque — pas à chaque requête.
         """
         if source not in SOURCES:
             raise ValueError(f"source inconnue : {source!r} (attendu : {', '.join(SOURCES)})")
