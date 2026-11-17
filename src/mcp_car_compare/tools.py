@@ -43,6 +43,8 @@ from .models import (
     MARKETS,
     MAX_BUDGET_S,
     MAX_PAGES,
+    MAX_PAGES_ANY,
+    MAX_PAGES_BY_SOURCE,
     MIN_COMPARABLES,
     PRICE_FLOOR_EUR,
     SERVED_SOURCES,
@@ -810,7 +812,11 @@ async def _harvest_one(
     # demander. Renseignée par CHAQUE sortie de boucle, faute de quoi la
     # dernière branche gagnante laisserait la valeur d'une autre.
     next_page: int | None = None
-    for page_number in range(max(1, start_page), criteria.pages_max + 1):
+        # Une source sans plafond déclaré (doublure de test, source future) prend la
+    # borne d'AutoScout24 : la plus basse connue, donc la plus sûre.
+    ceiling = MAX_PAGES_BY_SOURCE.get(source_name, MAX_PAGES)
+    page_ceiling = min(criteria.pages_max, ceiling)
+    for page_number in range(max(1, start_page), page_ceiling + 1):
         remaining = budget_s - (clock() - started)
         if remaining <= 0:
             status = "capped"
@@ -866,7 +872,7 @@ async def _harvest_one(
                     f"lecture incomplète : arrêt après {len(seen)} annonce(s) "
                     f"distincte(s) ({read} lue(s)) alors que la source en annonce "
                     f"{announced_total} — plafond de lecture (pages_max="
-                    f"{criteria.pages_max}) ou de la source"
+                    f"{page_ceiling}) ou de la source"
                 )
             # Une page vide ne dit pas la même chose selon la source. Pour une
             # source PAGE PAR PAGE (AutoScout24), elle signifie « le site
@@ -877,7 +883,7 @@ async def _harvest_one(
             # pages à demander : la reprise repart au-delà du plafond, avec un
             # plafond plus grand (que `criteria_fingerprint` n'invalide plus).
             if has_more:
-                next_page = criteria.pages_max + 1
+                next_page = page_ceiling + 1
             break
         read += page.rendered
         # Les doublons DANS la page ont déjà été retirés par l'adaptateur : ils
@@ -1108,12 +1114,19 @@ def _parse_criteria(raw: dict, *, pages_max: int) -> Criteria:
         limit = pages_max
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError(f"pages_max doit être un entier >= 1 : {limit!r}")
-    if limit > MAX_PAGES:
-        # Au-delà, AutoScout24 ne rend rien de plus : la récolte boucherait pour
-        # rien. La borne est nommée pour que l'appelant sache quoi corriger.
+    ceiling = max(MAX_PAGES_BY_SOURCE[name] for name in sources)
+    if limit > ceiling:
+        # La borne dépend des sources DEMANDÉES : 20 est le plafond réel
+        # d'AutoScout24, 30 la borne de sûreté de LaCentrale. Un message qui
+        # annonçait « plafond mesuré du site » pour toutes les sources était faux
+        # dès que la source était LaCentrale — mesuré le 2026-11-28 : 441
+        # annonces lues sur 524, puis un refus qui accusait le site.
+        detail = ", ".join(
+            f"{name} : {MAX_PAGES_BY_SOURCE[name]}" for name in sorted(set(sources))
+        )
         raise ValueError(
-            f"pages_max ne peut pas dépasser {MAX_PAGES} : {limit!r} "
-            "(plafond mesuré du site)"
+            f"pages_max ne peut pas dépasser {ceiling} pour ces sources "
+            f"({detail}) : {limit!r}"
         )
     bounds = {key: _optional_int(raw, key) for key in _INT_KEYS}
     return Criteria(

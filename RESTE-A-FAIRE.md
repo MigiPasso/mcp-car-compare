@@ -59,13 +59,20 @@ b. L'avertissement cite le jeton (`relance avec resume="…" pour élargir`),
 c. Le side-car accepte `start_page` : LaCentrale reprend à sa page sans relire
    (ni repayer) les précédentes.
 
-**Plafond de pages par source, pas global — à corriger.** `MAX_PAGES = 20`
-vient d'AutoScout24 (qui rend une page vide au-delà) et s'applique aujourd'hui à
-toutes les sources. Mesuré le 2026-11-28 : une recherche Yaris hybride annonce
-524 annonces sur LaCentrale (~22 pages), la reprise s'est arrêtée à **441/524**
-et `pages_max=21` a été refusé avec le message « plafond mesuré du site » — faux
-pour LaCentrale. Deux corrections : un plafond par source (`Site.MaxPages`), et
-un message qui nomme la source dont il parle.
+**Plafond de pages par source — FAIT le 2026-11-28.** `MAX_PAGES_BY_SOURCE`
+(autoscout24 : 20 — mesuré, page vide au-delà ; lacentrale : 30 — borne de sûreté,
+le site s'arrêtant de lui-même par une page vide), `MAX_PAGES_ANY` pour la borne
+d'un appel multi-sources, et le message nomme les sources et leurs plafonds.
+`pages_max=21` est donc accepté pour LaCentrale et refusé pour AutoScout24.
+
+**Reste ouvert, mesuré** : reprendre au-delà de la page 20 sur LaCentrale
+**expire** (`pages_max=22` et `25` avec `resume`, budget 60-90 s, côté client,
+même après avoir recyclé le conteneur). 441 annonces sur 524 sont atteignables ;
+les 83 dernières ne le sont pas encore. Piste : la page 21 de LaCentrale ne rend
+peut-être pas de cartes (le site s'arrête avant), et le navigateur attend son
+timeout au lieu de le constater — à mesurer avec une sonde directe sur
+`/p-21.html`. Gain réel faible : la médiane sur 311 hybrides ne bouge pas
+(16 950 € contre 16 895 € sur 116).
 
 **Contrainte de pas, mesurée après coup** : une reprise relance le navigateur
 (~20 s) puis lit ~8 s par page. `pages_max=2` puis `resume` avec `pages_max=6` a

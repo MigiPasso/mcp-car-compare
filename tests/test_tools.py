@@ -22,6 +22,8 @@ from mcp_car_compare.cursor import Cursor, CursorError, decode, encode
 from mcp_car_compare.models import (
     MAX_BUDGET_S,
     MAX_PAGES,
+    MAX_PAGES_ANY,
+    MAX_PAGES_BY_SOURCE,
     Criteria,
     Listing,
     Page,
@@ -896,14 +898,26 @@ def test_offers_reads_only_the_db_variable(tmp_path, monkeypatch):
         clock=lambda: 0.0,
     )
     result = harvest(mcp, {})
-    monkeypatch.setenv("MCC_PAGES_MAX", str(MAX_PAGES + 1))
+    # `MAX_PAGES_ANY` : 21 reste valide (LaCentrale monte à 30), donc la
+    # variable doit dépasser la borne la plus large pour être refusée.
+    monkeypatch.setenv("MCC_PAGES_MAX", str(MAX_PAGES_ANY + 1))
     page = mcp.tools["offers"](result["job_id"], None, 25)
     assert [item["source_id"] for item in page["items"]] == ["fr-001", "fr-002"]
     assert page["coverage"]["listings_distinct"] == 2
     # Le refus existe toujours, et il reste celui de `harvest` : les deux
-    # outils ne doivent pas être confondus sur ce point.
+    # outils ne doivent pas être confondus sur ce point. Le message nomme la
+    # SOURCE et son plafond (20 pour AutoScout24, 30 pour LaCentrale), plus la
+    # variable d'environnement fautive : deux leviers différents, deux noms.
     with pytest.raises(ValueError, match="MCC_PAGES_MAX"):
         harvest(mcp, {})
+    # La variable refusée tombe AVANT le parsage des critères : on la retire
+    # pour éprouver le refus par source, qui est l'autre levier.
+    monkeypatch.delenv("MCC_PAGES_MAX")
+    with pytest.raises(ValueError, match="autoscout24 : 20"):
+        harvest(mcp, {
+            "sources": ["autoscout24"],
+            "pages_max": MAX_PAGES_ANY + 1,
+        })
 
 
 def test_offers_never_builds_a_source(tmp_path):
@@ -1005,3 +1019,18 @@ def test_une_recolte_complete_ne_previent_de_rien(tmp_path):
     source = FakeSource([Page(listings=[listing(index) for index in range(3)], announced_total=3)])
     mcp = install(tmp_path, source)
     assert harvest(mcp, {"pages_max": 2})["warnings"] == []
+
+
+def test_le_plafond_de_pages_depend_de_la_source_demandee(tmp_path):
+    # Mesuré le 2026-11-28 : 21 pages étaient refusées pour TOUTES les sources,
+    # avec le message « plafond mesuré du site » — alors que 20 est le plafond
+    # d'AutoScout24, pas celui de LaCentrale, qui annonce 524 résultats (~22
+    # pages). Une recherche Yaris s'est arrêtée à 441/524 pour cette raison.
+    # Sans table par source, ce test rougit sur la première assertion.
+    assert MAX_PAGES_BY_SOURCE["lacentrale"] > MAX_PAGES_BY_SOURCE["autoscout24"]
+    assert MAX_PAGES_BY_SOURCE["autoscout24"] == MAX_PAGES
+
+    # LaCentrale accepte ce qu'AutoScout24 refuse, et le message nomme la source.
+    assert tools._parse_criteria({"sources": ["lacentrale"], "pages_max": MAX_PAGES + 1}, pages_max=5)
+    with pytest.raises(ValueError, match="autoscout24 : 20"):
+        tools._parse_criteria({"sources": ["autoscout24"], "pages_max": MAX_PAGES + 1}, pages_max=5)

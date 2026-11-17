@@ -103,7 +103,11 @@ REQUEST_TIMEOUT_S = 180.0
 
 # Plafond de pages par requête. 20 pages ≈ 480 annonces à 24 par page : au-delà,
 # c'est un balayage de marché, pas une récolte bornée.
-MAX_PAGES_CAP = 20
+# Borne de sûreté du navigateur, pas un plafond du site : LaCentrale annonce
+# jusqu'à 524 résultats (~22 pages) et une recherche plus large en demanderait
+# davantage. Le jour où le site s'arrête vraiment, la page rendue est vide —
+# c'est cette observation qui tranche, pas cette constante.
+MAX_PAGES_CAP = 40
 PAGINATION_PARAM = "page"
 
 # Page de départ quand l'appelant ne s'en prononce pas : le début.

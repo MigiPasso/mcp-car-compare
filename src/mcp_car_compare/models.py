@@ -98,6 +98,21 @@ MIN_COMPARABLES = 6
 # lit rien de plus : c'est un plafond du site, pas un objectif à dépasser.
 MAX_PAGES = 20
 
+# Le plafond de pages est une propriété de la SOURCE, pas du serveur. AutoScout24
+# s'arrête à 20 pages (mesuré le 2026-11-12 : au-delà, la page est vide, soit 400
+# annonces). LaCentrale, elle, en annonce jusqu'à 524 sur une recherche courante
+# (~22 pages, mesuré le 2026-11-28) : lui imposer 20 laissait 83 annonces hors
+# d'atteinte. La valeur de LaCentrale n'est PAS un plafond du site — c'est une
+# borne de sûreté, choisie pour qu'un appelant ne puisse pas demander mille
+# pages ; le jour où le site s'arrêtera vraiment, une page vide le dira (c'est
+# déjà ce que fait la branche « page vide »).
+MAX_PAGES_BY_SOURCE = {"autoscout24": 20, "lacentrale": 30}
+
+# La borne de sûreté d'un appel qui cite plusieurs sources : la plus large de
+# celles demandées. Sans ça, `pages_max: 10**9` passerait par la source la plus
+# permissive avant d'être refusé par l'autre.
+MAX_PAGES_ANY = max(MAX_PAGES_BY_SOURCE.values())
+
 # MAX_BUDGET_S borne un appel MCP : au-delà de dix minutes, un client a
 # abandonné la requête depuis longtemps et le corpus travaille pour personne.
 MAX_BUDGET_S = 600

@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .models import MAX_BUDGET_S, MAX_PAGES
+from .models import MAX_BUDGET_S, MAX_PAGES_ANY
 
 # Le défaut vise le volume Docker : dans l'image, `/data` est le point de
 # montage du corpus. Hors conteneur ce chemin n'est pas inscriptible, ce qui
@@ -81,6 +81,6 @@ def load_config() -> Config:
     return Config(
         db_path=Path(os.environ.get("MCC_DB", str(DEFAULT_DB))),
         budget_s=_env_int("MCC_BUDGET_S", DEFAULT_BUDGET_S, maximum=MAX_BUDGET_S),
-        pages_max=_env_int("MCC_PAGES_MAX", DEFAULT_PAGES_MAX, maximum=MAX_PAGES),
+        pages_max=_env_int("MCC_PAGES_MAX", DEFAULT_PAGES_MAX, maximum=MAX_PAGES_ANY),
         log_level=os.environ.get("MCC_LOG_LEVEL", DEFAULT_LOG_LEVEL).strip().upper(),
     )

@@ -12,7 +12,7 @@ import dataclasses
 import pytest
 
 from mcp_car_compare import config
-from mcp_car_compare.models import MAX_BUDGET_S, MAX_PAGES
+from mcp_car_compare.models import MAX_BUDGET_S, MAX_PAGES, MAX_PAGES_ANY
 
 
 @pytest.fixture(autouse=True)
@@ -88,7 +88,13 @@ def test_une_borne_nulle_ou_negative_est_refusee(
 
 @pytest.mark.parametrize(
     ("name", "value"),
-    [("MCC_BUDGET_S", str(MAX_BUDGET_S + 1)), ("MCC_PAGES_MAX", str(MAX_PAGES + 1))],
+    [
+        ("MCC_BUDGET_S", str(MAX_BUDGET_S + 1)),
+        # `MAX_PAGES_ANY` (30), pas `MAX_PAGES` (20) : le plafond dépend des
+        # sources demandées, et la configuration n'en connaît aucune. 21 est
+        # une valeur parfaitement valide pour LaCentrale.
+        ("MCC_PAGES_MAX", str(MAX_PAGES_ANY + 1)),
+    ],
 )
 def test_une_borne_au_dessus_du_plafond_est_refusee(
     monkeypatch: pytest.MonkeyPatch, name: str, value: str
