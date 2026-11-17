@@ -75,6 +75,6 @@ absentes : elles ne sont pas publiées dans le dépôt.
 
 ## Documentation
 
-- `INSTALL.md` — installer sur une autre machine (collaborateur ou image fournie).
+- `INSTALL.md` — installer sur une autre machine.
 - `PLAN.md` — conception, décisions prises et raisons.
 - `RESTE-A-FAIRE.md` — état du projet, ce qui reste, ce qui est mesuré.
