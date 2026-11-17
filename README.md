@@ -3,9 +3,8 @@
 Serveur MCP **stdio** qui récolte des annonces automobiles, les range dans un
 corpus SQLite et les rend à une IA pour choisir un modèle à acheter.
 
-Deux sources : **AutoScout24** (`.fr` et `.de`, en HTTPS) et **LaCentrale**
-(via un navigateur Camoufox, lancé dans le même conteneur). Tout tourne dans
-Docker ; aucun port, aucun jeton.
+Deux sources d'annonces, dont une lue par un navigateur embarqué. Tout tourne
+dans Docker ; aucun port, aucun jeton.
 
 ## Construire et lancer
 
@@ -43,31 +42,25 @@ Puis redémarrer le client. `mcp.example.json` est prêt à copier.
 
 | Outil | Rôle |
 |---|---|
-| `list_brands(source, market)` | les marques du site (~0,5 s) |
+| `list_brands(source, market)` | les marques disponibles |
 | `harvest(criteria, budget_s, resume)` | récolte bornée dans le temps, reprise sur jeton |
 | `offers(job_id, cursor, limit)` | pages de 25, avec écart au marché et doublons signalés |
 | `analyze_models(criteria, limit)` | médiane, quartiles et effectifs par modèle |
 
-`criteria` : `make`, `model` (libellés du site), `year_min/max`, `km_max`,
-`price_min/max`, `fuel`, `gear`, `markets`, `sources`, `pages_max` (10 par
-défaut, 20 pour AutoScout24 et 30 pour LaCentrale au plus).
+`criteria` : `make`, `model` (les libellés rendus par les annonces), `year_min`
+/ `year_max`, `km_max`, `price_min` / `price_max`, `fuel`, `gear`, `markets`,
+`sources`, `pages_max` (10 par défaut).
 
 ## Ce que les réponses disent toujours
 
 Chaque `harvest` et `offers` porte un bloc `coverage` : annonces **annoncées par
-le site**, **lues**, **uniques**, et si la lecture est tronquée. Le serveur
+la source**, **lues**, **uniques**, et si la lecture est tronquée. Le serveur
 n'affirme jamais avoir vu tout le marché. Un prix sous 100 € (« prix non
 communiqué ») est compté comme annonce mais exclu des médianes.
 
-## Limites connues
-
-- **LaCentrale** ne donne ni vendeur ni code postal, et ne filtre ni carburant
-  ni boîte (demander ces filtres est refusé, pas ignoré).
-- **AutoScout24** plafonne à 400 annonces par recherche.
-- Une lecture profonde LaCentrale coûte cher : ~20 s de navigateur + ~8 s par
-  page. Au-delà de 3-4 pages par appel, le client abandonne.
-- **Autohero** n'est pas branché (mesuré, bloqué sur un 401) — voir
-  `RESTE-A-FAIRE.md`.
+Une lecture profonde coûte du temps : la source qui passe par le navigateur
+demande ~20 s de démarrage puis ~8 s par page. Rester sous 3 à 4 pages par
+appel, et reprendre avec le jeton rendu.
 
 ## Tests
 
