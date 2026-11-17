@@ -39,6 +39,23 @@ Pistes, dans l'ordre : comparer en-têtes et cookies entre la sonde isolée et `
 
 ## Petits chantiers repérés mais non faits
 
+0. **PRIORITÉ : une récolte profonde est impossible, et l'avertissement le conseille quand même.**
+   Mesuré le 2026-11-28 : `harvest(sources=["lacentrale"], pages_max=20, budget_s=300)`
+   puis `pages_max=10, budget_s=100` ont **tous les deux expiré côté client** (`Request
+   timed out`), sans rien écrire en base — le vérificateur avait été écrit pour
+   des appels courts. Or le message de couverture dit « relance avec
+   `pages_max=20` pour élargir » : il conseille une action qui échoue. Deux
+   corrections, ensemble :
+   a. **Une récolte reprenable** : le `cursor` rendu par `harvest` est celui d'`offers`
+      (il ne reprend pas la récolte). Il faut un jeton de reprise propre à `harvest`
+      (source déjà commencée, page suivante, `job_id`), pour découper une lecture
+      profonde en plusieurs appels courts.
+   b. **Un avertissement qui tienne sa promesse** : tant que (a) n'existe pas, le
+      message doit annoncer la profondeur réellement atteignable au lieu de
+      conseiller 20 pages. Une consigne qui échoue est pire que pas de consigne.
+   Piste de repli immédiate : ~10 pages sur AutoScout24 (rapide, ~5 s) sont
+   atteignables ; c'est LaCentrale (navigateur, ~8 s/page) qui dépasse le délai.
+
 1. **`analyze_models` compte les doublons**, `offers.market_n` non : deux chiffres pour la même idée selon l'outil. À aligner (probablement dédupliquer côté analyse aussi).
 2. **`list_brands` rend 301 marques d'un coup** (~20 Ko) : lourd pour un contexte de modèle. Un filtre par préfixe ou une limite serait plus propre.
 3. **Rien ne purge le corpus** : il grossit à chaque récolte et les médianes portent sur tout l'historique. Une rétention (ou un `harvest` qui remplace) serait à décider.
